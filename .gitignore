@@ -1,0 +1,7 @@
+/.dockerignore
+/.env
+/.marscode
+/log-Linphone.pcap
+/log-MicroSIP.pcap
+/log-PortSIP.pcap
+/log-audio.pcap

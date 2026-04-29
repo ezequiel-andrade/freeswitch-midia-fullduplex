@@ -1,0 +1,468 @@
+/*
+ * audio_pipe.cpp — Full-Duplex WebSocket Audio Pipeline
+ * ======================================================
+ *
+ * FIXES APLICADOS:
+ *   [FIX #2] TxRingBuffer::push() — tail agora avança com módulo (era sem módulo,
+ *            causava acesso out-of-bounds após TX_RING_SAMPLES overflows acumulados).
+ *
+ *   [FIX #4] sq_push() — substituído lws_callback_on_writable() (inseguro cross-thread)
+ *            por lws_cancel_service() + LWS_CALLBACK_EVENT_WAIT_CANCELLED, padrão
+ *            idiomático do LWS para acordar o service loop de outra thread.
+ *
+ *   [FIX #5] tx_ready e ring buffer são resetados em CLIENT_CLOSED/CONNECTION_ERROR,
+ *            garantindo repreenchimento correto do jitter buffer após reconexão do bot.
+ *
+ *   [ARCH]   Cartesia agora entrega áudio nativo @ 8 kHz (pcm_s16le).
+ *            downsample_16_to_8 removida — TX path é push direto sem resample.
+ *            upsample_8_to_16 mantida (RX path: FS → STT Deepgram @ 16 kHz)
+ *            e melhorada para interpolação linear (melhor qualidade de voz).
+ *
+ * ARQUITETURA DE SAMPLE RATES:
+ *   RX (usuário → STT): FS 8 kHz → upsample linear → WS 16 kHz → Deepgram
+ *   TX (TTS → usuário): Cartesia 8 kHz → WS 8 kHz → push direto → WRITE_REPLACE → RTP
+ *
+ * Dependências: libwebsockets ≥ 4.x, C++14
+ */
+
+#include "audio_pipe.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <cstring>
+#include <libwebsockets.h>
+#include <string>
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Constantes
+ * ──────────────────────────────────────────────────────────────────────────── */
+static constexpr int FS_SAMPLE_RATE    = 8000;   // Hz — FreeSWITCH / RTP / Cartesia TTS
+static constexpr int BOT_SAMPLE_RATE   = 16000;  // Hz — Deepgram STT (RX path apenas)
+static constexpr int RESAMPLE_RATIO    = BOT_SAMPLE_RATE / FS_SAMPLE_RATE;  // 2
+
+// 20 ms @ 8 kHz = 160 amostras = 320 bytes  (frame FreeSWITCH + Cartesia TTS)
+static constexpr int FRAME_MS          = 20;
+static constexpr int FS_FRAME_SAMPLES  = FS_SAMPLE_RATE  * FRAME_MS / 1000;  // 160
+static constexpr int FS_FRAME_BYTES    = FS_FRAME_SAMPLES * 2;               // 320
+
+// 20 ms @ 16 kHz = 320 amostras = 640 bytes (usado SOMENTE no RX path → Deepgram)
+static constexpr int BOT_FRAME_SAMPLES = BOT_SAMPLE_RATE * FRAME_MS / 1000;  // 320
+static constexpr int BOT_FRAME_BYTES   = BOT_FRAME_SAMPLES * 2;              // 640
+
+// Jitter buffer TX: 40 ms = 2 frames FS (conservador, reduz cortes sem aumentar latência)
+// Ring buffer total: 400 ms = 20 frames FS (headroom para burst do bot)
+static constexpr int TX_JITTER_FRAMES  = 2;
+static constexpr int TX_RING_FRAMES    = 20;
+static constexpr int TX_RING_SAMPLES   = TX_RING_FRAMES * FS_FRAME_SAMPLES;  // 3200 int16
+
+// LWS send buffer (RX path): PRE_PADDING + payload + POST_PADDING
+static constexpr int AP_LWS_PRE  = LWS_PRE;
+static constexpr int AP_LWS_POST = 0;
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Resample — RX path: 8 kHz → 16 kHz (interpolação linear)
+ *
+ * Qualidade superior ao nearest-neighbor original: interpolação linear entre
+ * amostras consecutivas elimina aliasing audível em tons agudos (sibilantes,
+ * consoantes fricativas), importante para STT de qualidade.
+ *
+ * Custo computacional negligível: 1 soma + 1 shift por amostra @ 20ms/frame.
+ * ──────────────────────────────────────────────────────────────────────────── */
+static void upsample_8_to_16(const int16_t* src, int src_n, int16_t* dst) {
+    // dst deve ter src_n * 2 amostras
+    for (int i = 0; i < src_n - 1; ++i) {
+        dst[i * 2]     = src[i];
+        // Interpolação linear: média entre sample atual e próximo
+        dst[i * 2 + 1] = static_cast<int16_t>(
+            (static_cast<int32_t>(src[i]) + static_cast<int32_t>(src[i + 1])) / 2);
+    }
+    // Último par: repete a última amostra (sem próxima disponível)
+    dst[(src_n - 1) * 2]     = src[src_n - 1];
+    dst[(src_n - 1) * 2 + 1] = src[src_n - 1];
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * TxRingBuffer — SPSC lock-free
+ *   Produtor: thread LWS (LWS_CALLBACK_CLIENT_RECEIVE) — bot → ring
+ *   Consumidor: thread RTP (bug_callback WRITE_REPLACE) — ring → RTP
+ *
+ * [FIX #2] push(): tail agora avança com módulo em vez de fetch_add raw.
+ *   Antes: tail.fetch_add(1) sem módulo → após TX_RING_SAMPLES overflows
+ *          o valor atômico excedia 3200 → buf[tail] fora dos limites → UB/crash.
+ *   Agora: tail é sempre mantido em [0, TX_RING_SAMPLES).
+ *
+ * Política de overflow: drop-oldest (overwrite) — garante que o bot nunca
+ * bloqueia o event loop LWS nem trava o callback do media bug.
+ * ──────────────────────────────────────────────────────────────────────────── */
+struct TxRingBuffer {
+    int16_t          buf[TX_RING_SAMPLES];
+    std::atomic<int> head{0};   // escrita (LWS thread)
+    std::atomic<int> tail{0};   // leitura (RTP thread)
+    std::atomic<int> count{0};  // amostras disponíveis
+
+    TxRingBuffer() { std::memset(buf, 0, sizeof(buf)); }
+
+    // Produz `n` amostras. Se não houver espaço, descarta as mais antigas.
+    void push(const int16_t* src, int n) {
+        for (int i = 0; i < n; ++i) {
+            int h = head.load(std::memory_order_relaxed);
+            buf[h] = src[i];
+            // [FIX #2] head avança com módulo (já estava correto)
+            head.store((h + 1) % TX_RING_SAMPLES, std::memory_order_release);
+
+            int c = count.fetch_add(1, std::memory_order_acq_rel);
+            if (c >= TX_RING_SAMPLES - 1) {
+                // Overflow: descarta oldest — avança tail COM módulo
+                // [FIX #2] era: tail.fetch_add(1, ...) sem módulo → UB
+                int t_old = tail.load(std::memory_order_relaxed);
+                tail.store((t_old + 1) % TX_RING_SAMPLES, std::memory_order_release);
+                count.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        }
+    }
+
+    // Consome exatamente `n` amostras. Preenche silêncio se insuficiente.
+    void pop(int16_t* dst, int n) {
+        int avail = count.load(std::memory_order_acquire);
+        int read  = std::min(avail, n);
+        int t     = tail.load(std::memory_order_relaxed);
+
+        for (int i = 0; i < read; ++i) {
+            dst[i] = buf[t];
+            t = (t + 1) % TX_RING_SAMPLES;
+        }
+        tail.store(t, std::memory_order_release);
+        count.fetch_sub(read, std::memory_order_acq_rel);
+
+        if (read < n)
+            std::memset(dst + read, 0, (n - read) * sizeof(int16_t));
+    }
+
+    void reset() {
+        head.store(0, std::memory_order_release);
+        tail.store(0, std::memory_order_release);
+        count.store(0, std::memory_order_release);
+        std::memset(buf, 0, sizeof(buf));
+    }
+
+    int available() const { return count.load(std::memory_order_acquire); }
+};
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * AudioPipe — estado por sessão
+ * ──────────────────────────────────────────────────────────────────────────── */
+struct AudioPipe {
+    // ── WebSocket ──────────────────────────────────────────────────────────
+    lws_context*  lws_ctx   = nullptr;
+    lws*          wsi       = nullptr;
+    std::string   url;
+    bool          connected = false;
+    bool          closing   = false;
+
+    // ── TX (bot → FS RTP) — 8 kHz nativo (Cartesia) ──────────────────────
+    TxRingBuffer  tx_ring;
+    bool          tx_ready  = false;   // jitter buffer pré-carregado?
+
+    // ── RX accumulator (FS → bot) — acumula @ 8 kHz até 20ms completo ────
+    int16_t       rx_acc[FS_FRAME_SAMPLES];
+    int           rx_acc_fill = 0;
+
+    // ── Send queue SPSC (RX path: media bug → LWS thread) ─────────────────
+    // [FIX #4] Produtor (RTP thread) usa lws_cancel_service() para acordar
+    //          o LWS thread em vez de lws_callback_on_writable() diretamente.
+    struct TxMsg {
+        uint8_t data[AP_LWS_PRE + BOT_FRAME_BYTES + AP_LWS_POST];  // 16kHz upsampled
+        int     len;
+    };
+    static constexpr int SEND_QUEUE_SIZE = 8;
+    TxMsg             send_queue[SEND_QUEUE_SIZE];
+    std::atomic<int>  sq_head{0};
+    std::atomic<int>  sq_tail{0};
+    std::atomic<int>  sq_count{0};
+
+    // ── Callbacks do usuário ───────────────────────────────────────────────
+    AudioPipeEventCallback event_cb  = nullptr;
+    void*                  user_data = nullptr;
+
+    // [FIX #4] sq_push: usa lws_cancel_service() — thread-safe de qualquer contexto.
+    //          lws_callback_on_writable(wsi) é agendado dentro do LWS thread
+    //          via LWS_CALLBACK_EVENT_WAIT_CANCELLED.
+    bool sq_push(const uint8_t* payload, int len) {
+        if (sq_count.load(std::memory_order_acquire) >= SEND_QUEUE_SIZE)
+            return false;  // drop — backpressure, nunca bloqueia o thread RTP
+
+        int h = sq_head.load(std::memory_order_relaxed);
+        TxMsg& m = send_queue[h];
+        std::memcpy(m.data + AP_LWS_PRE, payload, len);
+        m.len = len;
+        sq_head.store((h + 1) % SEND_QUEUE_SIZE, std::memory_order_release);
+        sq_count.fetch_add(1, std::memory_order_acq_rel);
+
+        // [FIX #4] Acorda o lws_service thread de forma thread-safe.
+        //          lws_cancel_service() é documentado como seguro de qualquer thread.
+        //          O write real é agendado em LWS_CALLBACK_EVENT_WAIT_CANCELLED.
+        if (lws_ctx) lws_cancel_service(lws_ctx);
+        return true;
+    }
+
+    bool sq_pop(uint8_t** out_ptr, int* out_len) {
+        if (sq_count.load(std::memory_order_acquire) == 0) return false;
+        int t = sq_tail.load(std::memory_order_relaxed);
+        TxMsg& m = send_queue[t];
+        *out_ptr = m.data + AP_LWS_PRE;
+        *out_len = m.len;
+        sq_tail.store((t + 1) % SEND_QUEUE_SIZE, std::memory_order_release);
+        sq_count.fetch_sub(1, std::memory_order_acq_rel);
+        return true;
+    }
+};
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * LWS callback
+ * ──────────────────────────────────────────────────────────────────────────── */
+static int lws_callback(struct lws* wsi, enum lws_callback_reasons reason,
+                        void* user, void* in, size_t len)
+{
+    // user data por wsi (set via ci.userdata em ap_create)
+    AudioPipe* ap = reinterpret_cast<AudioPipe*>(lws_wsi_user(wsi));
+
+    switch (reason) {
+
+    case LWS_CALLBACK_CLIENT_ESTABLISHED:
+        ap->connected = true;
+        if (ap->event_cb) ap->event_cb(ap, AP_EVENT_CONNECTED, ap->user_data);
+        lws_callback_on_writable(wsi);  // seguro: estamos dentro do LWS callback
+        break;
+
+    case LWS_CALLBACK_CLIENT_CLOSED:
+    case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+        if (ap) {
+            ap->connected = false;
+            ap->wsi       = nullptr;
+
+            // [FIX #5] Reseta tx_ready e limpa ring buffer ao desconectar.
+            //          Sem isso, após reconexão o jitter buffer não seria
+            //          respeitado (tx_ready=true com ring vazio → silêncio errado).
+            ap->tx_ready = false;
+            ap->tx_ring.reset();
+
+            if (ap->event_cb) ap->event_cb(ap, AP_EVENT_DISCONNECTED, ap->user_data);
+        }
+        break;
+
+    /* ── [FIX #4] Acordado por lws_cancel_service() do thread RTP ─────── */
+    case LWS_CALLBACK_EVENT_WAIT_CANCELLED: {
+        // Neste callback, lws_wsi_user(wsi) pode ser NULL (wsi de sistema).
+        // Usamos lws_context_user() que retorna ap (set via info.user em ap_create).
+        AudioPipe* cap = reinterpret_cast<AudioPipe*>(
+            lws_context_user(lws_get_context(wsi)));
+        if (cap && cap->wsi && !cap->closing &&
+            cap->sq_count.load(std::memory_order_acquire) > 0) {
+            // Seguro: dentro do contexto LWS
+            lws_callback_on_writable(cap->wsi);
+        }
+        break;
+    }
+
+    case LWS_CALLBACK_CLIENT_WRITEABLE: {
+        // RX path: envia frame PCM @ 16 kHz (upsampled) para o bot / Deepgram
+        uint8_t* ptr  = nullptr;
+        int      plen = 0;
+        if (ap && ap->sq_pop(&ptr, &plen)) {
+            int rc = lws_write(wsi,
+                               ptr,
+                               static_cast<size_t>(plen),
+                               LWS_WRITE_BINARY);
+            if (rc < 0) break;  // erro de escrita — reconexão pode ser adicionada aqui
+        }
+        // Reagenda escrita se ainda há frames na fila (dentro do LWS ctx — seguro)
+        if (ap && ap->sq_count.load(std::memory_order_acquire) > 0)
+            lws_callback_on_writable(wsi);
+        break;
+    }
+
+    case LWS_CALLBACK_CLIENT_RECEIVE: {
+        /*
+         * TX path: recebe PCM binário @ 8 kHz do bot (Cartesia via bridge).
+         *
+         * [ARCH] Cartesia agora configurada com sample_rate=8000 — sem resample.
+         *        Cada frame esperado: FS_FRAME_BYTES (320 bytes = 20ms @ 8kHz).
+         *        Push direto no ring buffer, sem downsample.
+         *
+         * Fragmentos residuais (< 320 bytes) são descartados — o bot deve
+         * enviar frames alinhados. Se o bot enviar chunks maiores (burst),
+         * o while loop processa todos os frames completos.
+         */
+        if (!ap || !in || len == 0) break;
+
+        /* DBG: log primeiros 5 frames recebidos do bot */
+        { static int dbg_rx_count = 0;
+          if (dbg_rx_count < 5)
+              fprintf(stderr, "[audio_pipe] DBG CLIENT_RECEIVE #%d len=%zu available=%d\n",
+                      ++dbg_rx_count, len, ap->tx_ring.available()); }
+
+        const uint8_t* p   = reinterpret_cast<const uint8_t*>(in);
+        int            rem = static_cast<int>(len);
+
+        while (rem >= FS_FRAME_BYTES) {
+            const int16_t* src8 = reinterpret_cast<const int16_t*>(p);
+            ap->tx_ring.push(src8, FS_FRAME_SAMPLES);
+            p   += FS_FRAME_BYTES;
+            rem -= FS_FRAME_BYTES;
+        }
+        // Fragmento residual (< 320 bytes) descartado
+
+        // Jitter buffer: considera TX pronto após acumular TX_JITTER_FRAMES
+        if (!ap->tx_ready &&
+            ap->tx_ring.available() >= TX_JITTER_FRAMES * FS_FRAME_SAMPLES) {
+            ap->tx_ready = true;
+            fprintf(stderr, "[audio_pipe] DBG tx_ready=true available=%d\n",
+                    ap->tx_ring.available());
+        }
+        break;
+    }
+
+    default:
+        break;
+    }
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * API pública
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+static const lws_protocols protocols[] = {
+    { "audio.bot", lws_callback, 0, 0 },
+    { nullptr, nullptr, 0, 0 }
+};
+
+AudioPipe* ap_create(const char* url, AudioPipeEventCallback cb, void* user_data) {
+    auto* ap      = new AudioPipe();
+    ap->url       = url;
+    ap->event_cb  = cb;
+    ap->user_data = user_data;
+
+    lws_context_creation_info info{};
+    info.port      = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+    info.options   = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+    // [FIX #4] info.user aponta para ap → acessível via lws_context_user()
+    //          em LWS_CALLBACK_EVENT_WAIT_CANCELLED (onde lws_wsi_user pode ser NULL).
+    info.user      = ap;
+
+    ap->lws_ctx = lws_create_context(&info);
+    if (!ap->lws_ctx) {
+        delete ap;
+        return nullptr;
+    }
+
+    // Parse URL e cria conexão WS — formato esperado: ws://host:port/path
+    char host[128], path[256];
+    int  port   = 9998;
+    bool is_ssl = (ap->url.substr(0, 3) == "wss");
+
+    const char* u     = ap->url.c_str() + (is_ssl ? 6 : 5);
+    const char* slash = strchr(u, '/');
+    const char* colon = strchr(u, ':');
+    if (colon && (!slash || colon < slash)) {
+        int hlen = static_cast<int>(colon - u);
+        strncpy(host, u, std::min(hlen, 127));
+        host[std::min(hlen, 127)] = '\0';
+        port = atoi(colon + 1);
+    } else {
+        int hlen = slash ? static_cast<int>(slash - u) : static_cast<int>(strlen(u));
+        strncpy(host, u, std::min(hlen, 127));
+        host[std::min(hlen, 127)] = '\0';
+    }
+    strncpy(path, slash ? slash : "/", 255);
+
+    lws_client_connect_info ci{};
+    ci.context        = ap->lws_ctx;
+    ci.address        = host;
+    ci.port           = port;
+    ci.path           = path;
+    ci.host           = host;
+    ci.origin         = host;
+    ci.protocol       = protocols[0].name;
+    ci.ssl_connection = is_ssl ? LCCSCF_USE_SSL : 0;
+    ci.userdata       = ap;  // per-wsi user data: acessível via lws_wsi_user()
+
+    ap->wsi = lws_client_connect_via_info(&ci);
+    if (!ap->wsi) {
+        lws_context_destroy(ap->lws_ctx);
+        delete ap;
+        return nullptr;
+    }
+
+    return ap;
+}
+
+void ap_destroy(AudioPipe* ap) {
+    if (!ap) return;
+    ap->closing = true;
+    if (ap->wsi) lws_set_timeout(ap->wsi, PENDING_TIMEOUT_CLOSE_SEND, LWS_TO_KILL_ASYNC);
+    if (ap->lws_ctx) {
+        // Flush final: chamado após o lws_service thread ter parado (garantido
+        // pelo switch_thread_join em session_destroy antes de ap_destroy).
+        lws_service(ap->lws_ctx, 0);
+        lws_context_destroy(ap->lws_ctx);
+    }
+    delete ap;
+}
+
+/*
+ * ap_service — chamado periodicamente pelo lws_service_thread (≤ 5ms).
+ * Bloqueia até timeout ou evento de rede (incluindo lws_cancel_service wake-up).
+ */
+void ap_service(AudioPipe* ap, int timeout_ms) {
+    if (ap && ap->lws_ctx && !ap->closing)
+        lws_service(ap->lws_ctx, timeout_ms);
+}
+
+/*
+ * ap_on_rx_frame — chamado pelo media bug READ_REPLACE (thread RTP, 20ms).
+ * Acumula frame @ 8 kHz, faz upsample linear 8→16, enfileira para WS (STT).
+ * NUNCA bloqueia.
+ */
+void ap_on_rx_frame(AudioPipe* ap, const int16_t* pcm8, int samples8) {
+    if (!ap || !ap->connected || ap->closing) return;
+
+    int written = 0;
+    while (written < samples8) {
+        int room  = FS_FRAME_SAMPLES - ap->rx_acc_fill;
+        int avail = samples8 - written;
+        int copy  = std::min(room, avail);
+
+        std::memcpy(ap->rx_acc + ap->rx_acc_fill, pcm8 + written, copy * sizeof(int16_t));
+        ap->rx_acc_fill += copy;
+        written         += copy;
+
+        if (ap->rx_acc_fill == FS_FRAME_SAMPLES) {
+            // Frame completo: upsample linear 8→16 kHz e enfileira para WS
+            int16_t up[BOT_FRAME_SAMPLES];
+            upsample_8_to_16(ap->rx_acc, FS_FRAME_SAMPLES, up);
+            ap->sq_push(reinterpret_cast<const uint8_t*>(up), BOT_FRAME_BYTES);
+            ap->rx_acc_fill = 0;
+        }
+    }
+}
+
+/*
+ * ap_on_tx_frame — chamado pelo media bug WRITE_REPLACE (thread RTP, 20ms).
+ * Retira frame @ 8 kHz do ring buffer (Cartesia TTS nativo) e injeta no RTP.
+ * Se jitter buffer não estiver pronto ou ring vazio: silêncio.
+ * NUNCA bloqueia.
+ */
+void ap_on_tx_frame(AudioPipe* ap, int16_t* pcm8_out, int samples8) {
+    if (!ap || !ap->tx_ready) {
+        std::memset(pcm8_out, 0, samples8 * sizeof(int16_t));
+        return;
+    }
+    ap->tx_ring.pop(pcm8_out, samples8);
+}
+
+bool ap_is_connected(const AudioPipe* ap) {
+    return ap && ap->connected;
+}

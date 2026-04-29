@@ -1,0 +1,39 @@
+<!--
+  freeswitch/conf/dialplan/06_audio_bridge.xml
+  Bot Voice — ramal 509 conecta ao audio-bridge + bot.py
+-->
+<include>
+
+  <!-- ── Contexto default: chamadas de ramais registrados ── -->
+  <context name="default">
+    <extension name="bot-voice-509">
+      <condition field="destination_number" expression="^509$">
+
+        <!-- Codec L16 ANTES do answer — sem renegociação -->
+        <!--action application="set" data="absolute_codec_string=L16"/-->
+
+        <!-- Responde a chamada -->
+        <action application="answer"/>
+        <action application="sleep" data="200"/>
+
+	      <!-- Ativa mod_audio_fork — envia RX para o audio-bridge -->
+	      <action application="set" data='fork_res=${uuid_audio_fork(${uuid} start ws://127.0.0.1:9998 mono 16000 {"uuid":"${uuid}","bidirectional_audio_sample_rate":8000})}'/>
+        <action application="log" data="INFO === FORK: ${fork_res} ==="/>
+        
+        <!-- Park: mantém a chamada viva, bot injeta TX via uuid_displace -->
+        <action application="playback" data="silence_stream://-1"/>  
+
+      </condition>
+    </extension>
+  </context>
+
+  <!-- ── Contexto public: se vier de tronco SIP externo ── -->
+  <context name="public">
+    <extension name="bot-voice-509-public">
+      <condition field="destination_number" expression="^509$">
+        <action application="transfer" data="509 XML default"/>
+      </condition>
+    </extension>
+  </context>
+
+</include>

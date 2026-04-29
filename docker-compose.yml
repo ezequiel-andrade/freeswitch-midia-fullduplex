@@ -1,0 +1,100 @@
+# docker-compose.yml
+# =============================================================================
+# Stack: Redis · Bot (Pipecat) · audio-bridge (proxy) · FreeSWITCH
+# Full-duplex: sem ESL, sem FIFO, sem uuid_displace
+# =============================================================================
+
+services:
+
+  redis:
+    image: redis/redis-stack-server:7.4.0-v3
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: >
+      redis-stack-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --protected-mode no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Bot — Pipecat: Deepgram STT → OpenAI LLM → Cartesia TTS
+  # ---------------------------------------------------------------------------
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: bot
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
+      OPENAI_API_KEY:   ${OPENAI_API_KEY}
+      OPENAI_API_BASE:  ${OPENAI_API_BASE}
+      OPENAI_MODEL:     ${OPENAI_MODEL}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY}
+      REDIS_URL:        "redis://127.0.0.1:6379"
+      BOT_WS_PORT:      ${BOT_WS_PORT:-8000}
+      STT_MODEL:        ${STT_MODEL:-nova-3}
+      TTS_MODEL:        ${TTS_MODEL:-sonic-2}
+      TTS_VOICE:        ${TTS_VOICE:-a0e99841-438c-4a64-b679-ae501e7d6091}
+      TTS_LANGUAGE:     ${TTS_LANGUAGE:-pt}
+      LOG_LEVEL:        ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:${BOT_WS_PORT:-8000}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # FreeSWITCH — Motor SIP/RTP com mod_audio_fork full-duplex
+  # ---------------------------------------------------------------------------
+  freeswitch:
+    build:
+      context: ./freeswitch
+      dockerfile: Dockerfile
+      args:
+        SIGNALWIRE_TOKEN: ${SIGNALWIRE_TOKEN}
+    container_name: freeswitch
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      bot:
+        condition: service_healthy
+    volumes:
+      - /opt/freeswitch/conf:/opt/freeswitch-conf-src:ro
+      - /opt/freeswitch/sounds:/usr/share/freeswitch/sounds
+      - /opt/freeswitch/db:/var/lib/freeswitch/db
+      - /opt/freeswitch/log:/var/log/freeswitch
+      - /opt/freeswitch/run:/var/run/freeswitch
+      - /opt/freeswitch/recordings:/var/lib/freeswitch/recordings
+    environment:
+      EXTERNAL_IP: ${EXTERNAL_IP:-192.168.2.110}
+      INTERNAL_IP: ${INTERNAL_IP:-192.168.2.110}
+      BOT_HOST: "127.0.0.1"
+      BOT_PORT: "8000"
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    ulimits:
+      rtprio: 99
+      memlock: { soft: -1, hard: -1 }
+      nofile:  { soft: 65536, hard: 65536 }
+    healthcheck:
+      test: ["CMD", "fs_cli", "-x", "status"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

@@ -1,0 +1,28 @@
+# ── Core: Voice AI Pipeline ───────────────────────────────────────────────────
+# Pinado em >=1.1.0 (versão em produção).
+# ATENÇÃO: 1.x tem breaking changes em relação a 0.x:
+#   - FrameSerializerType removido de base_serializer
+#   - FastAPIWebsocketTransport movido para pipecat.transports.websocket.fastapi
+#   - vad_audio_passthrough removido do FastAPIWebsocketParams
+#   - LiveOptions agora fornecido pelo pipecat (não pelo deepgram-sdk v6)
+pipecat-ai[deepgram,openai,cartesia,silero]>=1.1.0,<2.0.0
+
+# ── Web server ────────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+uvloop>=0.20.0
+
+# ── HTTP / WebSocket ──────────────────────────────────────────────────────────
+# Deixar pipecat resolver as versões corretas dessas dependências transitivas.
+httpx>=0.28
+
+# ── Data / Env ────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.1
+pydantic>=2.10.6,<3
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+redis[hiredis]>=5.0.8
+
+# ── Utilitários ───────────────────────────────────────────────────────────────
+tenacity>=8.2.0             # retry com backoff exponencial
+serpapi>=0.1.5              # Google Search via SerpApi

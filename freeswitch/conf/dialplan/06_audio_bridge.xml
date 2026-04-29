@@ -1,0 +1,56 @@
+<!--
+  freeswitch/conf/dialplan/06_audio_bridge.xml
+  Full-Duplex — sem playback, sem uuid_displace, sem ESL para mídia.
+
+  FIX #1 aplicado: substituído uuid_audio_fork (API inexistente) pela app
+  correta "audio_fork", que é BLOQUEANTE por design: ela entra no
+  read_frame loop e mantém o canal ativo até o hangup.
+
+  Fluxo por chamada:
+    1. answer → aceita a chamada
+    2. sleep 200ms → aguarda o codec negociar (evita frames vazios iniciais)
+    3. audio_fork ws://... → BLOQUEIA aqui; read_frame loop ativo;
+       media bug captura RX (usuário→bot) e injeta TX (bot→usuário)
+       até switch_channel_ready() == false (hangup/transfer/error)
+-->
+<include>
+
+  <!-- ── Contexto default: chamadas de ramais registrados ── -->
+  <context name="default">
+    <extension name="bot-voice-509">
+      <condition field="destination_number" expression="^509$">
+
+        <!-- Responde a chamada -->
+        <action application="answer"/>
+
+        <!-- Aguarda negociação de codec (evita frames zerados nos primeiros 20ms) -->
+        <action application="sleep" data="200"/>
+
+        <!--
+          audio_fork <ws-url>
+
+          Bloqueia o thread do dialplan no read_frame loop enquanto a
+          chamada estiver ativa. Não retorna até o hangup.
+          O FreeSWITCH core aciona READ_REPLACE e WRITE_REPLACE no media
+          bug a cada 20ms — clock de mídia real, sem playback, sem park.
+        -->
+        
+        <action application="audio_fork" data="ws://127.0.0.1:8000/ws/audio/${uuid}"/>
+
+
+        <action application="log" data="INFO === audio_fork encerrado para ${uuid} ==="/>
+
+      </condition>
+    </extension>
+  </context>
+
+  <!-- ── Contexto public: redireciona para default ── -->
+  <context name="public">
+    <extension name="bot-voice-509-public">
+      <condition field="destination_number" expression="^509$">
+        <action application="transfer" data="509 XML default"/>
+      </condition>
+    </extension>
+  </context>
+
+</include>
