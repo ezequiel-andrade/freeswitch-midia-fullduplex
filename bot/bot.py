@@ -62,7 +62,12 @@ from starlette.websockets import WebSocketState
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import AudioRawFrame, Frame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    Frame,
+    InputAudioRawFrame,
+    OutputAudioRawFrame,
+    TTSSpeakFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -92,7 +97,6 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
-from pipecat.turns.user_mute import MuteUntilFirstBotCompleteUserMuteStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -149,7 +153,8 @@ class BridgeSerializer(FrameSerializer):
 
     async def deserialize(self, data: bytes | str) -> Frame | None:
         if isinstance(data, bytes) and data:
-            return AudioRawFrame(
+            # Pipecat 1.x espera InputAudioRawFrame vindo do transporte.
+            return InputAudioRawFrame(
                 audio=data,
                 sample_rate=self.SAMPLE_RATE,
                 num_channels=self.CHANNELS,
@@ -157,7 +162,8 @@ class BridgeSerializer(FrameSerializer):
         return None
 
     async def serialize(self, frame: Frame) -> bytes | None:
-        if isinstance(frame, AudioRawFrame) and frame.audio:
+        # Pipecat 1.x envia para o transporte frames de saída de áudio.
+        if isinstance(frame, OutputAudioRawFrame) and frame.audio:
             return frame.audio
         return None
 
@@ -242,15 +248,12 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
                 params=VADParams(
                     confidence=0.7,
                     start_secs=0.2,
-                    stop_secs=0.4,
+                    stop_secs=0.2,
                     min_volume=0.6,
                 )
             ),
-            user_mute_strategies=[
-                # Muta o usuário até o bot terminar sua primeira fala completa.
-                # Evita interrupção acidental da saudação por ruído de fundo.
-                MuteUntilFirstBotCompleteUserMuteStrategy(),
-            ],
+            # user_mute_strategies removido: TurnTrackingObserver crasha em
+            # AudioRawFrame (sem .id) no pipecat 1.1.0, nunca dispara unmute.
         ),
     )
 
@@ -276,7 +279,7 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
         pipeline,
         params=PipelineParams(
             allow_interruptions=True,
-            idle_timeout_secs=600,  # safety net: 10min sem atividade → encerra
+            idle_timeout_secs=300,  # safety net: 5min sem atividade → encerra
         ),
     )
 
@@ -284,7 +287,7 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
     async def _greet():
         await asyncio.sleep(0.5)
         logger.info(f"[{call_id}] Enviando saudação")
-        await task.queue_frame(TTSSpeakFrame("Olá! Aqui é a Astra. Como posso te ajudar hoje?"))
+        await task.queue_frames([TTSSpeakFrame("Olá! Aqui é a Astra. Como posso te ajudar hoje?")])
 
     asyncio.create_task(_greet(), name=f"greet-{call_id[:8]}")
 
