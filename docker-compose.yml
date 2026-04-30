@@ -1,7 +1,7 @@
 # docker-compose.yml
 # =============================================================================
-# Stack: Redis · Bot (Pipecat) · audio-bridge (proxy) · FreeSWITCH
-# Full-duplex: sem ESL, sem FIFO, sem uuid_displace
+# Stack: Redis · Bot (Pipecat) · FreeSWITCH
+# Full-duplex: Fork de áudio com mod_audio_fork
 # =============================================================================
 
 services:
