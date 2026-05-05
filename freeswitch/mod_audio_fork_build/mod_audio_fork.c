@@ -2,38 +2,55 @@
  * mod_audio_fork.c — Full-Duplex Audio Fork (read_frame loop como clock de mídia)
  * ======================================================================
  *
- * FIXES APLICADOS:
- *   [FIX #1] Dialplan corrigido em 06_audio_bridge.xml (app "audio_fork",
- *            não API "uuid_audio_fork"). Este arquivo não muda para esse fix.
+ * FIXES ORIGINAIS (mantidos):
+ *   [FIX #1] Dialplan usa app "audio_fork" (não API uuid_audio_fork).
+ *   [FIX #3] mod_audio_fork_shutdown(): join de todas as threads LWS antes
+ *            de destruir o pool do módulo.
  *
- *   [FIX #3] mod_audio_fork_shutdown(): agora aguarda (join) todas as threads
- *            LWS ativas antes de destruir o pool do módulo.
- *            Antes: pool destruído imediatamente enquanto threads ainda rodavam
- *            → acesso a memória liberada → crash no unload do módulo.
+ * MELHORIAS NOVAS:
+ *   [M2] Reconexão automática configurável via parâmetro max_reconnects.
+ *        Dialplan: <action application="audio_fork"
+ *                    data="ws://127.0.0.1:8000/${uuid} max_reconnects=5"/>
+ *        0 = sem reconexão (comportamento original, default).
+ *        -1 = reconexão infinita.
+ *        N  = até N tentativas antes de hangup.
+ *
+ *   [M5] API de métricas: uuid_audio_fork_stats <uuid>
+ *        Retorna JSON com tx_underruns, tx_ring_drops, sq_drops,
+ *        ws_reconnects, rx_frag_bytes — úteis para monitoramento Prometheus.
+ *
+ *   [AP_EVENT_RECONNECTING] Novo evento: loga tentativa de reconexão sem hangup.
  *
  * ARQUITETURA DE THREADS:
  *
  *   Thread 1 — Dialplan (app audio_fork):
- *     switch_core_session_read_frame() loop
- *     → mantém o clock de mídia RTP ativo (mesmo mecanismo do mod_conference)
- *     → aciona READ_REPLACE e WRITE_REPLACE no media bug a cada 20ms
- *     → bloqueia o dialplan (comportamento correto para app de mídia)
+ *     switch_core_session_read_frame() loop → clock de mídia RTP
+ *     → READ_REPLACE e WRITE_REPLACE a cada 20ms
  *
  *   Thread 2 — LWS service (por sessão):
  *     ap_service() em loop de 5ms
- *     → acorda por lws_cancel_service() quando há frames RX prontos
- *     → envia frames RX ao bot via WS; recebe TX do bot no ring buffer
+ *     → acorda por lws_cancel_service() quando há frames RX
+ *     → verifica timer de reconexão em WAIT_CANCELLED [M2]
  *
  *   Thread RTP (FreeSWITCH core):
- *     Aciona bug_callback READ_REPLACE  → ap_on_rx_frame() → sq_push()
- *     Aciona bug_callback WRITE_REPLACE → ap_on_tx_frame() → ring.pop()
+ *     READ_REPLACE  → ap_on_rx_frame() → upsample → sq_push → WS → STT
+ *     WRITE_REPLACE → ap_on_tx_frame() → ring.pop → RTP → usuário
  *
  * DIALPLAN:
- *   <action application="audio_fork" data="ws://127.0.0.1:8000/${uuid}"/>
- *   Bloqueia até o canal encerrar. Sem playback. Sem park. Sem ESL de mídia.
+ *   Sem reconexão (original):
+ *     <action application="audio_fork" data="ws://127.0.0.1:8000/${uuid}"/>
  *
- * API auxiliar (stop externo):
- *   uuid_audio_fork_stop <uuid>
+ *   Com reconexão (até 10 tentativas):
+ *     <action application="audio_fork"
+ *       data="ws://127.0.0.1:8000/${uuid} max_reconnects=10"/>
+ *
+ *   Reconexão infinita:
+ *     <action application="audio_fork"
+ *       data="ws://127.0.0.1:8000/${uuid} max_reconnects=-1"/>
+ *
+ * API auxiliar:
+ *   uuid_audio_fork_stop  <uuid>         — encerra fork
+ *   uuid_audio_fork_stats <uuid>         — JSON com métricas [M5]
  */
 
 #include <switch.h>
@@ -47,7 +64,8 @@ SWITCH_MODULE_DEFINITION(mod_audio_fork, mod_audio_fork_load,
 /* ─────────────────────────────────────────────────────────────────────────────
  * Constantes
  * ──────────────────────────────────────────────────────────────────────────── */
-#define FS_FRAME_SAMPLES 160   /* 20ms @ 8kHz = 160 amostras */
+#define FS_FRAME_SAMPLES      160   /* 20ms @ 8kHz */
+#define DEFAULT_MAX_RECONNECTS  0   /* 0 = sem reconexão (comportamento original) */
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Estrutura de sessão
@@ -57,20 +75,17 @@ typedef struct {
     AudioPipe            *ap;
     switch_media_bug_t   *bug;
     switch_thread_t      *svc_thread;
-    switch_atomic_t       running;     /* sinaliza parada ao lws_service_thread */
+    switch_atomic_t       running;
     switch_mutex_t       *mutex;
     switch_memory_pool_t *pool;
 } fork_session_t;
 
-/* Tabela global uuid → fork_session_t */
 static switch_hash_t         *sessions_hash  = NULL;
 static switch_mutex_t        *sessions_mutex = NULL;
 static switch_memory_pool_t  *module_pool    = NULL;
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * Thread dedicado ao lws_service (I/O WebSocket)
- *
- * Separado do read_frame loop para que latência de rede não afete o clock RTP.
+ * Thread LWS service
  * ──────────────────────────────────────────────────────────────────────────── */
 static void *SWITCH_THREAD_FUNC lws_service_thread(switch_thread_t *t, void *obj)
 {
@@ -80,8 +95,8 @@ static void *SWITCH_THREAD_FUNC lws_service_thread(switch_thread_t *t, void *obj
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
                       "[%s] lws_service thread iniciado\n", fs->uuid);
 
-    while (fs->running) {
-        ap_service(fs->ap, 5);  /* bloqueia até 5ms ou wake-up por lws_cancel_service */
+    while (switch_atomic_read(&fs->running)) {
+        ap_service(fs->ap, 5);
     }
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
@@ -90,7 +105,7 @@ static void *SWITCH_THREAD_FUNC lws_service_thread(switch_thread_t *t, void *obj
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * Callbacks de conexão do AudioPipe
+ * Event handler do AudioPipe
  * ──────────────────────────────────────────────────────────────────────────── */
 static void ap_event_handler(AudioPipe *ap, AudioPipeEvent ev, void *user_data)
 {
@@ -98,21 +113,30 @@ static void ap_event_handler(AudioPipe *ap, AudioPipeEvent ev, void *user_data)
     (void)ap;
 
     switch (ev) {
+
     case AP_EVENT_CONNECTED:
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
                           "[%s] WebSocket conectado ao bot\n", fs->uuid);
         break;
+
+    /* [M2] Reconexão em andamento — apenas loga, não faz hangup */
+    case AP_EVENT_RECONNECTING:
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                          "[%s] WebSocket desconectado — tentando reconexão...\n",
+                          fs->uuid);
+        break;
+
+    /* DISCONNECTED final: sem reconexão configurada OU tentativas esgotadas */
     case AP_EVENT_DISCONNECTED:
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                          "[%s] WebSocket desconectado do bot — encerrando chamada\n", fs->uuid);
-        /* Encerra o canal para evitar chamada zumbi com TX silencioso */
+                          "[%s] WebSocket desconectado do bot — encerrando chamada\n",
+                          fs->uuid);
         {
             switch_core_session_t *sw = switch_core_session_locate(fs->uuid);
             if (sw) {
                 switch_channel_hangup(
                     switch_core_session_get_channel(sw),
-                    SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER
-                );
+                    SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER);
                 switch_core_session_rwunlock(sw);
             }
         }
@@ -121,10 +145,7 @@ static void ap_event_handler(AudioPipe *ap, AudioPipeEvent ev, void *user_data)
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * Media Bug Callback
- *
- * Chamado pelo thread RTP do FreeSWITCH a cada frame (20ms).
- * NUNCA bloqueia. NUNCA aloca memória.
+ * Media Bug Callback — chamado pelo thread RTP, NUNCA bloqueia
  * ──────────────────────────────────────────────────────────────────────────── */
 static switch_bool_t bug_callback(switch_media_bug_t *bug,
                                   void *user_data,
@@ -145,12 +166,11 @@ static switch_bool_t bug_callback(switch_media_bug_t *bug,
                           "[%s] Media bug fechado\n", fs->uuid);
         break;
 
-    /* ── RX: voz do usuário → bot (Deepgram STT) ────────────────────────── */
+    /* ── RX: voz do usuário → bot (STT) ──────────────────────────────────── */
     case SWITCH_ABC_TYPE_READ_REPLACE:
         frame = switch_core_media_bug_get_read_replace_frame(bug);
         if (!frame || !frame->data || frame->datalen == 0) break;
         if (!ap_is_connected(fs->ap)) break;
-
         ap_on_rx_frame(fs->ap,
                        (const int16_t *)frame->data,
                        (int)(frame->datalen / sizeof(int16_t)));
@@ -160,11 +180,9 @@ static switch_bool_t bug_callback(switch_media_bug_t *bug,
     case SWITCH_ABC_TYPE_WRITE_REPLACE: {
         frame = switch_core_media_bug_get_write_replace_frame(bug);
         if (!frame || !frame->data) break;
-
         ap_on_tx_frame(fs->ap, (int16_t *)frame->data, FS_FRAME_SAMPLES);
         frame->datalen = FS_FRAME_SAMPLES * sizeof(int16_t);
         frame->samples = FS_FRAME_SAMPLES;
-
         switch_core_media_bug_set_write_replace_frame(bug, frame);
         break;
     }
@@ -177,10 +195,43 @@ static switch_bool_t bug_callback(switch_media_bug_t *bug,
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * session_create — setup completo: AudioPipe + lws thread + media bug
+ * parse_url_and_reconnects — separa URL do parâmetro max_reconnects
+ *
+ * Entrada:  "ws://host:port/path max_reconnects=10"
+ * Saída:    url_out = "ws://host:port/path"  (copiado para buf_url)
+ *           max_reconnects_out = 10
+ *
+ * Compatibilidade: se não houver max_reconnects=, comportamento original
+ * (max_reconnects=0, sem reconexão).
+ * ──────────────────────────────────────────────────────────────────────────── */
+static void parse_url_and_reconnects(const char *data,
+                                     char *buf_url, int buf_url_len,
+                                     int *max_reconnects_out)
+{
+    *max_reconnects_out = DEFAULT_MAX_RECONNECTS;
+
+    /* Copia dados para buffer mutável */
+    char tmp[1024];
+    strncpy(tmp, data, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    /* Procura por " max_reconnects=" */
+    char *param = strstr(tmp, " max_reconnects=");
+    if (param) {
+        *param = '\0';  /* trunca URL no espaço */
+        *max_reconnects_out = atoi(param + 16);  /* strlen(" max_reconnects=") = 16 */
+    }
+
+    strncpy(buf_url, tmp, buf_url_len - 1);
+    buf_url[buf_url_len - 1] = '\0';
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * session_create
  * ──────────────────────────────────────────────────────────────────────────── */
 static fork_session_t *session_create(switch_core_session_t *sw_session,
-                                      const char *ws_url)
+                                      const char *ws_url,
+                                      int max_reconnects)
 {
     const char *uuid = switch_core_session_get_uuid(sw_session);
 
@@ -190,11 +241,12 @@ static fork_session_t *session_create(switch_core_session_t *sw_session,
     fork_session_t *fs = (fork_session_t *)switch_core_alloc(pool, sizeof(*fs));
     memset(fs, 0, sizeof(*fs));
     strncpy(fs->uuid, uuid, SWITCH_UUID_FORMATTED_LENGTH);
-    fs->pool    = pool;
-    fs->running = 1;
+    fs->pool = pool;
+    switch_atomic_set(&fs->running, 1);
     switch_mutex_init(&fs->mutex, SWITCH_MUTEX_NESTED, pool);
 
-    fs->ap = ap_create(ws_url, ap_event_handler, fs);
+    /* [M2] max_reconnects passado ao ap_create */
+    fs->ap = ap_create(ws_url, ap_event_handler, fs, max_reconnects);
     if (!fs->ap) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
                           "[%s] ap_create falhou para %s\n", uuid, ws_url);
@@ -202,18 +254,15 @@ static fork_session_t *session_create(switch_core_session_t *sw_session,
         return NULL;
     }
 
-    /* Registra na tabela global antes de iniciar threads */
     switch_mutex_lock(sessions_mutex);
     switch_core_hash_insert(sessions_hash, uuid, fs);
     switch_mutex_unlock(sessions_mutex);
 
-    /* Inicia thread do LWS — joinable (detach=0) para garantir join no teardown */
     switch_threadattr_t *ta;
     switch_threadattr_create(&ta, pool);
-    switch_threadattr_detach_set(ta, 0);
+    switch_threadattr_detach_set(ta, 0);  /* joinable */
     switch_thread_create(&fs->svc_thread, ta, lws_service_thread, fs, pool);
 
-    /* Adiciona media bug: READ_REPLACE + WRITE_REPLACE = full-duplex */
     switch_status_t st = switch_core_media_bug_add(
         sw_session,
         "audio_fork_fullduplex",
@@ -228,8 +277,7 @@ static fork_session_t *session_create(switch_core_session_t *sw_session,
     if (st != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
                           "[%s] switch_core_media_bug_add falhou\n", uuid);
-        fs->running = 0;
-        /* Join thread antes de destruir o pool */
+        switch_atomic_set(&fs->running, 0);
         if (fs->svc_thread) {
             switch_status_t ignored;
             switch_thread_join(&ignored, fs->svc_thread);
@@ -246,28 +294,21 @@ static fork_session_t *session_create(switch_core_session_t *sw_session,
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * session_destroy — teardown: remove bug → para lws thread → libera pool
- *
- * Ordem crítica:
- *   1. fs->running = 0  → sinaliza lws_service_thread para parar
- *   2. switch_thread_join → aguarda lws thread terminar (até ~5ms)
- *   3. switch_core_media_bug_remove → para callbacks do thread RTP
- *   4. ap_destroy → fecha WS e libera AudioPipe
- *   5. switch_core_destroy_memory_pool → libera pool (agora seguro)
+ * session_destroy — ordem crítica: join LWS → remove bug → destroy ap → pool
  * ──────────────────────────────────────────────────────────────────────────── */
 static void session_destroy(fork_session_t *fs, switch_core_session_t *sw_session)
 {
     const char *uuid = fs->uuid;
 
-    /* 1+2. Para o lws_service thread e aguarda conclusão */
-    fs->running = 0;
+    /* 1+2. Para e aguarda a LWS thread */
+    switch_atomic_set(&fs->running, 0);
     if (fs->svc_thread) {
         switch_status_t ignored;
         switch_thread_join(&ignored, fs->svc_thread);
         fs->svc_thread = NULL;
     }
 
-    /* 3. Remove o media bug (para callbacks do thread RTP) */
+    /* 3. Remove media bug (para callbacks do thread RTP) */
     if (sw_session && fs->bug) {
         switch_core_media_bug_remove(sw_session, &fs->bug);
         fs->bug = NULL;
@@ -278,11 +319,11 @@ static void session_destroy(fork_session_t *fs, switch_core_session_t *sw_sessio
     switch_core_hash_delete(sessions_hash, uuid);
     switch_mutex_unlock(sessions_mutex);
 
-    /* 5. Destrói AudioPipe (lws thread já parado — seguro) */
+    /* 5. Destrói AudioPipe ([M6] flush WS CLOSE correto) */
     ap_destroy(fs->ap);
     fs->ap = NULL;
 
-    /* 6. Pool liberado por último */
+    /* 6. Pool por último */
     switch_core_destroy_memory_pool(&fs->pool);
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
@@ -291,20 +332,6 @@ static void session_destroy(fork_session_t *fs, switch_core_session_t *sw_sessio
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * APLICAÇÃO DE DIALPLAN — audio_fork
- *
- * Uso:
- *   <action application="audio_fork" data="ws://127.0.0.1:8000/${uuid}"/>
- *
- * Bloqueia o thread do dialplan enquanto a chamada estiver ativa.
- * O loop read_frame é o clock canônico do FreeSWITCH — mesmo mecanismo
- * usado por mod_conference, mod_loopback e mod_sofia internamente.
- *
- * Fluxo por iteração (20ms):
- *   1. read_frame lê o frame do codec (sincronizado com timer RTP)
- *   2. Core executa todos os media bugs do canal:
- *      a. READ_REPLACE  → bug_callback → ap_on_rx_frame() → WS → STT
- *      b. WRITE_REPLACE → bug_callback → ap_on_tx_frame() → RTP → usuário
- *   3. read_frame retorna (frame ignorado — bug já processou tudo)
  * ──────────────────────────────────────────────────────────────────────────── */
 SWITCH_STANDARD_APP(audio_fork_app)
 {
@@ -328,10 +355,16 @@ SWITCH_STANDARD_APP(audio_fork_app)
         return;
     }
 
-    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-                      "[%s] audio_fork iniciando → %s\n", uuid, (char *)data);
+    /* [M2] Parse URL e max_reconnects do parâmetro data */
+    char    ws_url[1024];
+    int     max_reconnects = DEFAULT_MAX_RECONNECTS;
+    parse_url_and_reconnects((const char *)data, ws_url, sizeof(ws_url), &max_reconnects);
 
-    fork_session_t *fs = session_create(session, (const char *)data);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                      "[%s] audio_fork iniciando → %s (max_reconnects=%d)\n",
+                      uuid, ws_url, max_reconnects);
+
+    fork_session_t *fs = session_create(session, ws_url, max_reconnects);
     if (!fs) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
                           "[%s] audio_fork: falha ao criar sessão\n", uuid);
@@ -341,56 +374,25 @@ SWITCH_STANDARD_APP(audio_fork_app)
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
                       "[%s] audio_fork: entrando no read_frame loop\n", uuid);
 
-    /*
-     * ════════════════════════════════════════════════════════════════════════
+    /* ════════════════════════════════════════════════════════════════════════
      * CLOCK DE MÍDIA — Loop canônico
-     *
-     * switch_core_session_read_frame() aciona READ_REPLACE no media bug.
-     * switch_core_session_write_frame() aciona WRITE_REPLACE (TTS → RTP).
-     *
-     * O loop termina quando:
-     *   - switch_channel_ready() retorna false (hangup, transfer, error)
-     *   - SWITCH_READ_ACCEPTABLE() retorna false (erro de codec, canal morto)
-     * ════════════════════════════════════════════════════════════════════════
-     */
-    /*
-     * Write frame de silêncio — WRITE_REPLACE precisa de switch_core_session_write_frame()
-     * para disparar. Sem write_frame, SWITCH_ABC_TYPE_WRITE_REPLACE nunca é chamado
-     * e o TTS do bot nunca chega ao RTP.
-     *
-     * O bug intercepta cada write_frame antes da codificação e substitui o conteúdo
-     * pelo PCM do ring buffer (TTS Cartesia @ 8 kHz). Quando o ring está vazio,
-     * ap_on_tx_frame preenche com silêncio.
-     */
-    uint8_t                write_buf[SWITCH_RECOMMENDED_BUFFER_SIZE];
-    switch_frame_t         write_frame = {0};
+     * ════════════════════════════════════════════════════════════════════════ */
+    uint8_t        write_buf[SWITCH_RECOMMENDED_BUFFER_SIZE];
+    switch_frame_t write_frame = {0};
     write_frame.data    = write_buf;
     write_frame.buflen  = SWITCH_RECOMMENDED_BUFFER_SIZE;
-    write_frame.datalen = FS_FRAME_SAMPLES * sizeof(int16_t);  /* 320 bytes = 20ms @ 8kHz */
+    write_frame.datalen = FS_FRAME_SAMPLES * sizeof(int16_t);
     write_frame.samples = FS_FRAME_SAMPLES;
     write_frame.codec   = switch_core_session_get_write_codec(session);
 
     switch_frame_t *read_frame;
     while (switch_channel_ready(channel)) {
         switch_status_t st = switch_core_session_read_frame(
-            session, &read_frame, SWITCH_IO_FLAG_NONE, 0
-        );
+            session, &read_frame, SWITCH_IO_FLAG_NONE, 0);
 
-        if (!SWITCH_READ_ACCEPTABLE(st)) {
-            break;
-        }
+        if (!SWITCH_READ_ACCEPTABLE(st)) break;
 
-        /*
-         * Escreve silêncio no canal → dispara SWITCH_ABC_TYPE_WRITE_REPLACE →
-         * bug_callback chama ap_on_tx_frame → TTS do ring buffer substitui silêncio →
-         * frame vai para o codec (PCMU) → RTP → telefone do usuário.
-         *
-         * [FIX: Linphone re-INVITE] Refresha o codec a cada iteração.
-         * Clientes como Linphone enviam re-INVITE durante a chamada (renegociação
-         * ICE/SDP). O FreeSWITCH troca o write_codec do session. Se write_frame.codec
-         * apontar para o codec antigo, o frame é processado incorretamente → áudio
-         * corrompido por ~440ms (INVITE t=0.5s até ACK t=0.94s no Linphone).
-         */
+        /* [FIX: Linphone re-INVITE] Refresha codec a cada iteração */
         write_frame.codec   = switch_core_session_get_write_codec(session);
         write_frame.datalen = FS_FRAME_SAMPLES * sizeof(int16_t);
         write_frame.samples = FS_FRAME_SAMPLES;
@@ -405,10 +407,7 @@ SWITCH_STANDARD_APP(audio_fork_app)
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * API auxiliar: uuid_audio_fork_stop <uuid>
- *
- * Para stop externo (ex: IVR retomando controle, transferência).
- * Emite hangup no canal → read_frame loop detecta → session_destroy().
+ * API: uuid_audio_fork_stop <uuid>
  * ──────────────────────────────────────────────────────────────────────────── */
 SWITCH_STANDARD_API(uuid_audio_fork_stop_function)
 {
@@ -428,12 +427,59 @@ SWITCH_STANDARD_API(uuid_audio_fork_stop_function)
 
     switch_core_session_t *sw_session = switch_core_session_locate(cmd);
     if (sw_session) {
-        switch_channel_t *ch = switch_core_session_get_channel(sw_session);
-        switch_channel_hangup(ch, SWITCH_CAUSE_NORMAL_CLEARING);
+        switch_channel_hangup(switch_core_session_get_channel(sw_session),
+                              SWITCH_CAUSE_NORMAL_CLEARING);
         switch_core_session_rwunlock(sw_session);
     }
 
     stream->write_function(stream, "+OK sinal de stop enviado para %s\n", cmd);
+    return SWITCH_STATUS_SUCCESS;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * [M5] API: uuid_audio_fork_stats <uuid>
+ *
+ * Retorna snapshot JSON das métricas do AudioPipe para a sessão indicada.
+ * Útil para monitoramento externo (Prometheus, Grafana, alertas).
+ *
+ * Saída:
+ *   +OK {"uuid":"...","tx_underruns":N,"tx_ring_drops":N,"sq_drops":N,
+ *        "ws_reconnects":N,"rx_frag_bytes":N,"jitter_frames":N}
+ * ──────────────────────────────────────────────────────────────────────────── */
+SWITCH_STANDARD_API(uuid_audio_fork_stats_function)
+{
+    if (!cmd || !*cmd) {
+        stream->write_function(stream, "-ERR uso: uuid_audio_fork_stats <uuid>\n");
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    switch_mutex_lock(sessions_mutex);
+    fork_session_t *fs = (fork_session_t *)switch_core_hash_find(sessions_hash, cmd);
+    switch_mutex_unlock(sessions_mutex);
+
+    if (!fs || !fs->ap) {
+        stream->write_function(stream, "-ERR sessão não encontrada: %s\n", cmd);
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    AudioPipeStats s = ap_get_stats(fs->ap);
+    stream->write_function(stream,
+        "+OK {\"uuid\":\"%s\","
+        "\"connected\":%s,"
+        "\"tx_underruns\":%" SWITCH_UINT64_T_FMT ","
+        "\"tx_ring_drops\":%" SWITCH_UINT64_T_FMT ","
+        "\"sq_drops\":%" SWITCH_UINT64_T_FMT ","
+        "\"ws_reconnects\":%" SWITCH_UINT64_T_FMT ","
+        "\"rx_frag_bytes\":%" SWITCH_UINT64_T_FMT "}\n",
+        fs->uuid,
+        ap_is_connected(fs->ap) ? "true" : "false",
+        (uint64_t)s.tx_underruns,
+        (uint64_t)s.tx_ring_drops,
+        (uint64_t)s.sq_drops,
+        (uint64_t)s.ws_reconnects,
+        (uint64_t)s.rx_frag_bytes
+    );
+
     return SWITCH_STATUS_SUCCESS;
 }
 
@@ -452,9 +498,9 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
     SWITCH_ADD_APP(app_interface,
                    "audio_fork",
                    "Full-duplex audio fork via WebSocket (read_frame loop)",
-                   "audio_fork <ws-url>",
+                   "audio_fork <ws-url> [max_reconnects=N]",
                    audio_fork_app,
-                   "<ws-url>",
+                   "<ws-url> [max_reconnects=N]",
                    SAF_NONE);
 
     switch_api_interface_t *api_interface;
@@ -464,28 +510,19 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
                    uuid_audio_fork_stop_function,
                    "<uuid>");
 
+    SWITCH_ADD_API(api_interface,
+                   "uuid_audio_fork_stats",
+                   "Get audio fork metrics for a channel (JSON)",
+                   uuid_audio_fork_stats_function,
+                   "<uuid>");
+
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
                       "mod_audio_fork (full-duplex, read_frame loop) carregado\n");
     return SWITCH_STATUS_SUCCESS;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * [FIX #3] mod_audio_fork_shutdown — aguarda todas as threads LWS antes
- *          de destruir o pool do módulo.
- *
- * Antes: pool destruído imediatamente enquanto threads lws_service_thread
- *        ainda acessavam fs->ap, fs->uuid, etc. → use-after-free → crash.
- *
- * Agora:
- *   1. Coleta ponteiros de todas as sessões ativas (sob mutex)
- *   2. Sinaliza running=0 para cada uma
- *   3. Faz join em cada lws_service_thread (aguarda ≤ ~5ms por sessão)
- *   4. Só então destrói hash e pool
- *
- * Nota: switch_core_media_bug_remove não é chamado aqui porque os canais
- * devem ter sido encerrados antes do unload do módulo (comportamento
- * padrão do FreeSWITCH). Se houver canais ainda ativos no unload, o core
- * os encerrará e acionará session_destroy via hangup.
+ * [FIX #3] mod_audio_fork_shutdown
  * ──────────────────────────────────────────────────────────────────────────── */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
 {
@@ -493,7 +530,6 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
     fork_session_t *to_stop[MAX_SESSIONS_SHUTDOWN];
     int             nstop = 0;
 
-    /* 1. Coleta sessões ativas sob mutex */
     switch_mutex_lock(sessions_mutex);
     for (switch_hash_index_t *hi = switch_core_hash_first(sessions_hash);
          hi;
@@ -501,16 +537,14 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
     {
         void *val = NULL;
         switch_core_hash_this(hi, NULL, NULL, &val);
-        if (val && nstop < MAX_SESSIONS_SHUTDOWN) {
+        if (val && nstop < MAX_SESSIONS_SHUTDOWN)
             to_stop[nstop++] = (fork_session_t *)val;
-        }
     }
     switch_mutex_unlock(sessions_mutex);
 
-    /* 2+3. Sinaliza parada e aguarda cada thread LWS */
     for (int i = 0; i < nstop; i++) {
         fork_session_t *fs = to_stop[i];
-        fs->running = 0;
+        switch_atomic_set(&fs->running, 0);
         if (fs->svc_thread) {
             switch_status_t ignored;
             switch_thread_join(&ignored, fs->svc_thread);
@@ -518,7 +552,6 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
         }
     }
 
-    /* 4. Destrói hash e pool (threads já paradas — seguro) */
     switch_mutex_lock(sessions_mutex);
     switch_core_hash_destroy(&sessions_hash);
     switch_mutex_unlock(sessions_mutex);
