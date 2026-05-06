@@ -128,19 +128,20 @@ static void ap_event_handler(AudioPipe *ap, AudioPipeEvent ev, void *user_data)
 
     /* DISCONNECTED final: sem reconexão configurada OU tentativas esgotadas */
     case AP_EVENT_DISCONNECTED:
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                          "[%s] WebSocket desconectado do bot — encerrando chamada\n",
-                          fs->uuid);
-        {
-            switch_core_session_t *sw = switch_core_session_locate(fs->uuid);
-            if (sw) {
-                switch_channel_hangup(
-                    switch_core_session_get_channel(sw),
-                    SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER);
-                switch_core_session_rwunlock(sw);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                      "[%s] WebSocket encerrado — finalizando chamada\n",
+                      fs->uuid);
+    {
+        switch_core_session_t *sw = switch_core_session_locate(fs->uuid);
+        if (sw) {
+            switch_channel_t *ch = switch_core_session_get_channel(sw);
+            if (switch_channel_ready(ch)) {
+                switch_channel_hangup(ch, SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER);
             }
+            switch_core_session_rwunlock(sw);
         }
-        break;
+    }
+    break;
     }
 }
 
@@ -234,6 +235,7 @@ static fork_session_t *session_create(switch_core_session_t *sw_session,
                                       int max_reconnects)
 {
     const char *uuid = switch_core_session_get_uuid(sw_session);
+    switch_channel_t *channel = switch_core_session_get_channel(sw_session);
 
     switch_memory_pool_t *pool;
     switch_core_new_memory_pool(&pool);
@@ -245,8 +247,57 @@ static fork_session_t *session_create(switch_core_session_t *sw_session,
     switch_atomic_set(&fs->running, 1);
     switch_mutex_init(&fs->mutex, SWITCH_MUTEX_NESTED, pool);
 
-    /* [M2] max_reconnects passado ao ap_create */
-    fs->ap = ap_create(ws_url, ap_event_handler, fs, max_reconnects);
+    /* [N1] Campos fixos do FreeSWITCH */
+    const char *caller = switch_channel_get_variable(channel, "caller_id_number");
+    const char *dest   = switch_channel_get_variable(channel, "destination_number");
+    const char *dir    = switch_channel_direction(channel) == SWITCH_CALL_DIRECTION_INBOUND
+                           ? "inbound" : "outbound";
+
+    /* Monta JSON base com campos fixos */
+    char metadata_json[2048];
+    int pos = switch_snprintf(
+        metadata_json, sizeof(metadata_json),
+        "{\"uuid\":\"%s\",\"direction\":\"%s\",\"caller\":\"%s\","
+        "\"destination\":\"%s\",\"sip_sample_rate\":8000,\"ws_sample_rate\":16000",
+        uuid    ? uuid   : "",
+        dir,
+        caller  ? caller : "",
+        dest    ? dest   : ""
+    );
+
+    /* [N1] Campos dinâmicos: variáveis de canal com prefixo "af_meta_" */
+    switch_event_t *vars = NULL;
+    if (switch_channel_get_variables(channel, &vars) == SWITCH_STATUS_SUCCESS && vars) {
+        switch_event_header_t *h;
+        for (h = vars->headers; h && pos < (int)sizeof(metadata_json) - 64; h = h->next) {
+            if (!h->name || strncmp(h->name, "af_meta_", 8) != 0) continue;
+            pos += switch_snprintf(metadata_json + pos,
+                                   sizeof(metadata_json) - pos,
+                                   ",\"%s\":\"%s\"",
+                                   h->name + 8,           /* remove prefixo */
+                                   h->value ? h->value : "");
+        }
+        switch_event_destroy(&vars);
+    }
+
+    /* Fecha o JSON */
+    if (pos < (int)sizeof(metadata_json) - 2)
+        metadata_json[pos++] = '}';
+    metadata_json[pos] = '\0';
+
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                      "[%s] metadata_json=%s\n", uuid, metadata_json);
+
+    /* [N2] Headers HTTP extras via variável de canal "af_extra_headers" */
+    const char *extra_headers = switch_channel_get_variable(channel, "af_extra_headers");
+
+    /* [N1/N2/M2] monta config para ap_create */
+    AudioPipeConfig cfg = {0};
+    cfg.metadata_json          = metadata_json;
+    cfg.extra_headers          = extra_headers;   /* NULL se não configurado */
+    cfg.max_reconnect_attempts = max_reconnects;
+
+    fs->ap = ap_create(ws_url, ap_event_handler, fs, &cfg);
     if (!fs->ap) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
                           "[%s] ap_create falhou para %s\n", uuid, ws_url);
@@ -300,30 +351,51 @@ static void session_destroy(fork_session_t *fs, switch_core_session_t *sw_sessio
 {
     const char *uuid = fs->uuid;
 
-    /* 1+2. Para e aguarda a LWS thread */
-    switch_atomic_set(&fs->running, 0);
+    /* 1. Sinaliza parada para a LWS thread */
+    switch_atomic_set(&fs->running, 0); /* ← para o loop da LWS thread */
+
+    /* 2. Acorda a LWS thread IMEDIATAMENTE via lws_cancel_service().
+     *
+     * Sem isso, a thread fica bloqueada até o próximo timeout de ap_service()
+     * (5ms por iteração), mas na prática o LWS pode estar aguardando eventos
+     * de rede internos (ex: TCP FIN do bot, timeout de keepalive) que podem
+     * demorar segundos — causando o teardown lento de 15s observado nos logs.
+     *
+     * lws_cancel_service() é thread-safe: usa um pipe/eventfd interno do LWS
+     * para acordar o select/epoll da thread de serviço imediatamente.
+     * A thread acorda, entra em LWS_CALLBACK_EVENT_WAIT_CANCELLED, checa
+     * switch_atomic_read(&fs->running) == 0 via ap_service(), e sai do loop.
+     *
+     * Acesso a fs->ap->lws_ctx é seguro aqui porque:
+     *   - fs->ap só é destruído no passo 5, após o join
+     *   - lws_ctx só é destruído dentro de ap_destroy() — ainda não ocorreu
+     */
+    ap_set_closing(fs->ap);              /* closing=true ANTES do cancel */
+    ap_cancel_service(fs->ap);           /* acorda a thread imediatamente */
+
+    /* 3. Aguarda a LWS thread encerrar (join) */
     if (fs->svc_thread) {
         switch_status_t ignored;
         switch_thread_join(&ignored, fs->svc_thread);
         fs->svc_thread = NULL;
     }
 
-    /* 3. Remove media bug (para callbacks do thread RTP) */
+    /* 4. Remove media bug (para callbacks do thread RTP) */
     if (sw_session && fs->bug) {
         switch_core_media_bug_remove(sw_session, &fs->bug);
         fs->bug = NULL;
     }
 
-    /* 4. Remove da tabela global */
+    /* 5. Remove da tabela global */
     switch_mutex_lock(sessions_mutex);
     switch_core_hash_delete(sessions_hash, uuid);
     switch_mutex_unlock(sessions_mutex);
 
-    /* 5. Destrói AudioPipe ([M6] flush WS CLOSE correto) */
+    /* 6. Destrói AudioPipe ([M6] flush WS CLOSE correto) */
     ap_destroy(fs->ap);
     fs->ap = NULL;
 
-    /* 6. Pool por último */
+    /* 7. Pool por último */
     switch_core_destroy_memory_pool(&fs->pool);
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,

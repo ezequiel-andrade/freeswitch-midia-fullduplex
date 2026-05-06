@@ -1,0 +1,191 @@
+<!--
+  /etc/freeswitch/dialplan/default.xml  (ou arquivo separado incluído nele)
+  =========================================================================
+
+  CENÁRIO:
+    Ramal 1000 (MicroSIP) liga para o número 510
+    → FreeSWITCH recebe a chamada
+    → Toca ringback para o caller enquanto conecta
+    → Instala o media bug full-duplex (mod_audio_fork)
+    → RX (voz do usuário): 8kHz → SpeexDSP upsample → 16kHz → WS → FastAPI/STT
+    → TX (voz do bot):     FastAPI/TTS → WS → 8kHz → RTP → usuário
+
+  FLUXO DE ÁUDIO RESUMIDO:
+                    ┌─────────────────────────────────────────────────┐
+    Softphone       │              FreeSWITCH                         │        FastAPI
+    MicroSIP ──RTP──►  media bug READ_REPLACE                         │
+    (8kHz)          │       │ ap_on_rx_frame()                        │
+                    │       │ SpeexDSP: 8kHz→16kHz                   │
+                    │       └──────────────────────── WS ────────────►│ STT→LLM→TTS
+                    │                                                  │
+                    │  media bug WRITE_REPLACE        WS ◄────────────│ (8kHz PCM)
+                    │       ap_on_tx_frame()          │               │
+    Softphone ◄─RTP─│       ring.pop() 8kHz ◄─────────┘               │
+    (8kHz)          │                                                  │
+                    └─────────────────────────────────────────────────┘
+
+  REQUISITOS DO LADO DO BOT (FastAPI):
+    • Recebe áudio: frames binários WS de 640 bytes (320 samples PCM L16 16kHz)
+    • Envia áudio:  frames binários WS de 320 bytes (160 samples PCM L16 8kHz)
+    • Primeiro frame recebido: texto JSON com metadata da chamada
+    • Exemplo de metadata recebida:
+        {"uuid":"abc-123","direction":"inbound","caller":"1000",
+         "destination":"510","sample_rate":8000}
+
+  REQUISITOS DE INSTALAÇÃO:
+    1. Compilar e instalar mod_audio_fork.so
+       cd /path/to/mod_audio_fork && make && make install
+       fs_cli -x "reload mod_audio_fork"
+
+    2. Certificar que o módulo está em modules.conf.xml:
+       <load module="mod_audio_fork"/>
+
+    3. FastAPI rodando em 127.0.0.1:8000
+       (veja exemplo de servidor ao final deste arquivo)
+-->
+
+<include>
+  <context name="default">
+
+    <!-- ================================================================
+         Ramal 1000 → 510 : bot de voz full-duplex
+         ================================================================ -->
+    <extension name="bot_voicebot_510">
+      <condition field="destination_number" expression="^510$">
+
+        <!-- ── 1. Configura headers de autenticação para o WS (opcional) ──
+             Se o seu bot não requer autenticação, remova as duas linhas
+             abaixo. O valor ${bot_token} pode vir de um arquivo de config
+             ou de uma variável global definida em vars.xml. -->
+        <action application="set"
+                data="af_extra_headers=Authorization: Bearer ${bot_token}&#10;X-Session-ID: ${uuid}&#10;"/>
+        <!--
+          Nota: &#10; é o caractere \n (newline) no XML.
+          Resultado: "Authorization: Bearer <token>\nX-Session-ID: <uuid>\n"
+          mod_audio_fork lê "af_extra_headers" via switch_channel_get_variable()
+          e passa para ap_create() → lws_add_http_header_by_name() no handshake.
+        -->
+
+        <!-- ── 2. Campos extras de metadata (opcional) ────────────────────
+             Qualquer variável com prefixo "af_meta_" vira campo no JSON
+             enviado ao bot imediatamente após a conexão WS.
+             Exemplo: {"uuid":"...","caller":"1000","plan":"premium"} -->
+        <action application="set" data="af_meta_plan=premium"/>
+        <action application="set" data="af_meta_language=pt-BR"/>
+
+        <!-- ── 3. Configura codec: G.711 μ-law (PCMU) — padrão telefonia ──
+             PCMU = PCM linear @ 8kHz com compressão µ-law.
+             mod_audio_fork trabalha com PCM L16 internamente (decodificado
+             pelo FreeSWITCH antes de chegar ao media bug). -->
+        <action application="set" data="codec_string=PCMU"/>
+        <action application="set" data="codec_fallback=PCMA"/>
+
+        <!-- ── 4. Desativa silence suppression e VAD ──────────────────────
+             Importante: com VAD ativo, o FS suprime frames de silêncio e
+             o media bug não recebe frames contínuos. Isso quebra o clock
+             de 20ms e causa gaps no STT. -->
+        <action application="set" data="send_silence_when_idle=true"/>
+        <action application="set" data="start_dtmf_generate=false"/>
+
+        <!-- ── 5. Ringback para o caller enquanto o bot conecta ───────────
+             O bot pode demorar alguns frames para responder. O ringback
+             garante que o usuário ouça sinal de chamada durante esse tempo.
+             "%(2000,4000,440,480)" = 2s de toque, 4s de silêncio, 440+480Hz -->
+        <action application="pre_answer"/>
+        <action application="playback"
+                data="tone_stream://%(2000,4000,440,480);loops=3"/>
+
+        <!-- ── 6. Atende a chamada ────────────────────────────────────────
+             answer() inicia o RTP bidirecional. A partir daqui, o media
+             bug pode capturar frames RX e injetar frames TX. -->
+        <action application="answer"/>
+
+        <!-- ── 7. Silêncio inicial (jitter buffer do bot) ─────────────────
+             200ms de silêncio garantem que o jitter buffer do bot esteja
+             cheio antes do usuário começar a falar. Evita o artefato de
+             "corte do início da fala". -->
+        <action application="sleep" data="200"/>
+
+        <!-- ── 8. Inicia o fork full-duplex (formato original) ───────────
+             Metadados extras são enviados no primeiro JSON usando af_meta_*. -->
+        <action application="set" data="af_meta_direction=inbound"/>
+        <action application="set" data="af_meta_caller=${caller_id_number}"/>
+        <action application="set" data="af_meta_destination=${destination_number}"/>
+        <action application="set" data="af_meta_sample_rate=16000"/>
+        <action application="audio_fork" data="ws://127.0.0.1:8000/ws/${uuid} max_reconnects=5"/>
+
+        <!-- ── 9. Pós-fork: executado quando audio_fork retorna ───────────
+             audio_fork retorna quando:
+               a) A chamada é encerrada normalmente (hangup do usuário)
+               b) O bot fecha o WS e max_reconnects se esgota
+               c) switch_channel_ready() retorna false por outro motivo
+             Aqui podemos registrar o fim da chamada ou encaminhar. -->
+        <action application="log" data="INFO Bot call ended for ${uuid}"/>
+        <action application="hangup" data="NORMAL_CLEARING"/>
+
+      </condition>
+    </extension>
+
+  </context>
+</include>
+
+<!--
+  ============================================================================
+  EXEMPLO DE SERVIDOR FASTAPI (bot.py)
+  ============================================================================
+
+  Requisitos:
+    pip install fastapi uvicorn websockets
+
+  Execução:
+    uvicorn bot:app --host 127.0.0.1 --port 8000
+
+  O servidor abaixo é um esqueleto mínimo que demonstra:
+    - Receber o frame JSON de metadata
+    - Receber frames PCM 16kHz (640 bytes = 320 samples) do FreeSWITCH
+    - Enviar frames PCM 8kHz (320 bytes = 160 samples) de volta
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  import asyncio
+  import json
+  from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+  app = FastAPI()
+
+  FRAME_BYTES_IN  = 640   # recebe: 320 samples × 2 bytes × 16kHz × 20ms
+  FRAME_BYTES_OUT = 320   # envia:  160 samples × 2 bytes × 8kHz  × 20ms
+
+  @app.websocket("/ws/{uuid}")
+  async def websocket_endpoint(ws: WebSocket, uuid: str):
+      await ws.accept()
+      metadata = None
+
+      try:
+          while True:
+              msg = await ws.receive()
+
+              # Primeiro frame: metadata JSON (tipo text)
+              if msg["type"] == "websocket.receive" and "text" in msg:
+                  metadata = json.loads(msg["text"])
+                  print(f"[{uuid}] Conectado — metadata: {metadata}")
+                  continue
+
+              # Frames de áudio: PCM L16 binário 16kHz
+              if msg["type"] == "websocket.receive" and "bytes" in msg:
+                  audio_in = msg["bytes"]  # 640 bytes, 16kHz, mono
+
+                  # TODO: enviar audio_in para STT (ex: Deepgram, Whisper)
+                  # TODO: processar resposta LLM
+                  # TODO: sintetizar TTS (ex: Cartesia, ElevenLabs)
+
+                  # Envia áudio TTS de volta como PCM L16 8kHz, 320 bytes/frame
+                  # Exemplo: silêncio (substituir pelo TTS real)
+                  audio_out = bytes(FRAME_BYTES_OUT)
+                  await ws.send_bytes(audio_out)
+
+      except WebSocketDisconnect:
+          print(f"[{uuid}] Desconectado")
+
+  ============================================================================
+-->

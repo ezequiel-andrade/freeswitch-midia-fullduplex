@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       g++ \
       libwebsockets-dev \
+      libspeexdsp-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -60,7 +61,7 @@ RUN g++ -std=c++14 -fPIC -O2 \
         -I/usr/local/freeswitch/include/freeswitch \
         -I/usr/include \
         -c audio_pipe.cpp -o audio_pipe.o \
- && gcc -fPIC -O2 \
+ && g++ -std=c++14 -fPIC -O2 \
         -I/usr/local/freeswitch/include/freeswitch \
         -I/usr/include \
         -c mod_audio_fork.c -o mod_audio_fork.o \
@@ -69,6 +70,7 @@ RUN g++ -std=c++14 -fPIC -O2 \
         -o mod_audio_fork.so \
         mod_audio_fork.o audio_pipe.o \
         -lwebsockets \
+        -lspeexdsp \
         -lstdc++ -lpthread \
  && echo "✔ mod_audio_fork.so compilado" \
  && ldd mod_audio_fork.so | grep websockets
@@ -88,6 +90,7 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
       netcat-openbsd curl iproute2 sox \
       $(apt-cache search 'libwebsockets[0-9]' 2>/dev/null | awk 'NR==1{print $1}') \
+      $(apt-cache search '^libspeexdsp[0-9]+$' 2>/dev/null | awk 'NR==1{print $1}') \
     && rm -rf /var/lib/apt/lists/*
 
 # Instala o módulo compilado no stage anterior

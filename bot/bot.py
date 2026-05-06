@@ -629,11 +629,75 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
     logger.info(f"[{call_id}] Pipeline iniciando (full-duplex)")
     last_user_text = ""
 
+    # ── [MOD_AUDIO_FORK] Captura frame de metadata inicial ────────────────
+    # O mod_audio_fork envia um frame WebSocket TEXT (JSON) imediatamente
+    # após a conexão, antes de qualquer frame de áudio. Esse frame contém
+    # informações da chamada montadas pelo mod_audio_fork.c:
+    #
+    # Campos fixos (sempre presentes):
+    #   uuid, direction, caller, destination,
+    #   sip_sample_rate (8000 — taxa nativa da chamada SIP),
+    #   ws_sample_rate  (16000 — taxa do áudio enviado via WS após upsample)
+    #
+    # Campos dinâmicos (opcionais, vindos de variáveis af_meta_* no dialplan):
+    #   plan, language, e qualquer outro af_meta_* configurado
+    #
+    # Exemplo de payload recebido:
+    #   {"uuid":"abc-123","direction":"inbound","caller":"1000",
+    #    "destination":"510","sip_sample_rate":8000,"ws_sample_rate":16000,
+    #    "plan":"premium","language":"pt-BR"}
+    #
+    # Precisamos consumir este frame ANTES de passar o websocket para o
+    # FastAPIWebsocketTransport, pois o transport não sabe que o primeiro
+    # frame é JSON de controle — ele tentaria deserializá-lo como PCM e
+    # o BridgeSerializer retornaria None (descarte silencioso, sem crash).
+    #
+    # Estratégia: receive() com timeout de 3s. Se não chegar ou não for
+    # JSON válido, seguimos com metadata vazia (chamada funciona normalmente).
+    call_metadata: dict = {}
+    try:
+        first_msg = await asyncio.wait_for(websocket.receive(), timeout=3.0)
+        raw = first_msg.get("text") if isinstance(first_msg, dict) else None
+        if raw:
+            incoming = json.loads(raw)
+            if isinstance(incoming, dict):
+                # Normaliza campos fixos com fallbacks seguros.
+                # sip_sample_rate e ws_sample_rate substituem o antigo "sample_rate".
+                call_metadata = {
+                    "uuid":            str(incoming.get("uuid")            or call_id),
+                    "direction":       str(incoming.get("direction")       or "inbound"),
+                    "caller":          str(incoming.get("caller")          or ""),
+                    "destination":     str(incoming.get("destination")     or ""),
+                    "sip_sample_rate": int(incoming.get("sip_sample_rate") or 8000),
+                    "ws_sample_rate":  int(incoming.get("ws_sample_rate")  or 16000),
+                }
+                # Preserva campos dinâmicos af_meta_* (plan, language, etc.)
+                # que o C injeta iterando variáveis de canal prefixadas com "af_meta_".
+                for key, val in incoming.items():
+                    if key not in call_metadata:
+                        call_metadata[key] = val
+
+                logger.info(
+                    f"[{call_id}] Metadata recebida: "
+                    f"uuid={call_metadata.get('uuid', '?')} "
+                    f"caller={call_metadata.get('caller', '?')} "
+                    f"destination={call_metadata.get('destination', '?')} "
+                    f"direction={call_metadata.get('direction', '?')} "
+                    f"sip_sample_rate={call_metadata.get('sip_sample_rate', '?')} "
+                    f"ws_sample_rate={call_metadata.get('ws_sample_rate', '?')} "
+                    f"plan={call_metadata.get('plan', '?')} "
+                    f"language={call_metadata.get('language', '?')}"
+                )
+            else:
+                logger.warning(f"[{call_id}] Metadata JSON não é um objeto — ignorando")
+        else:
+            logger.warning(f"[{call_id}] Primeiro frame não veio como TEXT (metadata ausente)")
+    except asyncio.TimeoutError:
+        logger.warning(f"[{call_id}] Timeout aguardando metadata — continuando sem ela")
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning(f"[{call_id}] Metadata inválida ou ausente: {e}")
+
     # ── Transport ──────────────────────────────────────────────────────────
-    # [NEW #2] VAD removido do transport params — migrado para LLMUserAggregatorParams.
-    # [FIX #5] vad_audio_passthrough REMOVIDO no pipecat 1.x junto com
-    #          vad_enabled e vad_analyzer do FastAPIWebsocketParams.
-    #          O equivalente atual é audio_in_passthrough (default=True no 1.x).
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
@@ -646,7 +710,6 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
             audio_in_sample_rate=16000,
         ),
     )
-
     # ── STT ───────────────────────────────────────────────────────────────
     # [FIX #1] LiveOptions agora importado de pipecat.services.deepgram.stt,
     # não do deepgram SDK (que removeu LiveOptions no v6).
@@ -865,7 +928,7 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
 app = FastAPI(title="Astra Voice Bot")
 
 
-@app.websocket("/ws/audio/{call_id}")
+@app.websocket("/ws/{call_id}")
 async def ws_audio(websocket: WebSocket, call_id: str) -> None:
     await websocket.accept()
     logger.info(f"Bridge conectou: {call_id}")

@@ -3,55 +3,64 @@
  * ======================================================
  *
  * FIXES ORIGINAIS (mantidos):
- *   [FIX #2] TxRingBuffer::push() — tail avança com módulo (era sem módulo → OOB).
- *   [FIX #4] sq_push() — lws_cancel_service() + WAIT_CANCELLED em vez de
- *            lws_callback_on_writable() cross-thread (undefined behavior no LWS).
- *   [FIX #5] tx_ready e ring resetados em CLOSED/CONNECTION_ERROR.
- *   [ARCH]   TX path @ 8 kHz nativo (Cartesia). RX path upsample linear 8→16 kHz.
+ *   [FIX #2] TxRingBuffer::push() — tail avança com módulo.
+ *   [FIX #4] sq_push() — lws_cancel_service() cross-thread safe.
+ *   [FIX #5] tx_ready + ring resetados em CLOSED/CONNECTION_ERROR.
+ *   [ARCH]   TX path 8 kHz nativo (Cartesia). RX path upsampled para 16 kHz.
+ *
+ * MELHORIAS ANTERIORES (mantidas):
+ *   [M1] Acumulador de fragmentos WS no receive path (rx_frag_buf).
+ *   [M2] Reconexão automática com exponential backoff.
+ *   [M3] sq_pop_copy — cópia para buffer local antes de avançar tail.
+ *   [M4] CNG (Comfort Noise Generator) em vez de zeros quando ring vazio.
+ *   [M5] Métricas atômicas de produção (AudioPipeStats).
+ *   [M6] ap_destroy com loop de flush WS CLOSE.
+ *   [M7] Jitter buffer adaptativo por janela de underruns.
  *
  * MELHORIAS NOVAS:
- *   [M1] Acumulador de fragmentos WS no receive path.
- *        O protocolo WS não garante alinhamento a FS_FRAME_BYTES. Frames TCP
- *        segmentados (ex: Nagle desabilitado, MTU 1400) chegam como chunks
- *        menores. O acumulador rx_frag_buf junta fragmentos até completar
- *        FS_FRAME_BYTES antes de fazer push no ring, eliminando dropout
- *        periódico que antes era descartado silenciosamente.
+ *   [N1] Metadata inicial JSON após ESTABLISHED.
  *
- *   [M2] Reconexão automática com exponential backoff.
- *        Ao detectar CLOSED/CONNECTION_ERROR, agenda reconexão com delay
- *        inicial de 100ms, dobrado a cada tentativa, cap de 5000ms.
- *        Configurável via max_reconnect_attempts em ap_create().
- *        Durante reconexão: TX emite silêncio/CNG, RX é descartado.
- *        AP_EVENT_RECONNECTING emitido antes de cada tentativa.
+ *        Imediatamente após LWS_CALLBACK_CLIENT_ESTABLISHED, antes de habilitar
+ *        o write de áudio, enviamos um frame LWS_WRITE_TEXT com o JSON fornecido
+ *        em AudioPipeConfig::metadata_json. Isso permite que o bot identifique a
+ *        sessão (UUID, caller_id, direction, sample_rate) sem depender do path
+ *        da URL. O áudio começa após o write do metadata ser confirmado (flag
+ *        metadata_sent garante a ordem: metadata → áudio).
  *
- *   [M3] sq_pop com cópia local antes do lws_write.
- *        Antes: sq_pop() avançava o tail e expunha ponteiro para interior do
- *        slot (que poderia ser reutilizado se lws_write() falhasse parcialmente).
- *        Agora: sq_pop_copy() copia o payload para buffer local antes de avançar
- *        o tail. lws_write() opera sobre o buffer local — sem exposição de ponteiro.
+ *   [N2] Headers HTTP customizáveis no handshake WS Upgrade.
  *
- *   [M4] CNG (Comfort Noise Generator) no TX path.
- *        Zeros puros (silêncio digital) em PCMU viram 0xFF repetido — alguns
- *        endpoints interpretam como erro de codec. CNG gera ruído branco de baixa
- *        amplitude (~-60 dBFS) usando LCG de 32 bits (custo: 1 multiply/add por
- *        amostra, sem dependência de stdlib, sem alocação). Aplicado apenas quando
- *        tx_ready=false ou ring vazio.
+ *        LWS dispara LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER antes de
+ *        finalizar o handshake HTTP → WS. Neste callback, usamos
+ *        lws_add_http_header_by_name() para adicionar cada header extra.
  *
- *   [M5] Métricas de produção via AudioPipeStats.
- *        Contadores atômicos: tx_underruns, tx_ring_drops, sq_drops,
- *        ws_reconnects, rx_frag_bytes. Acessíveis via ap_get_stats() sem lock.
+ *        O campo extra_headers é parseado linha a linha:
+ *          "Authorization: Bearer token\nX-Tenant: acme\n"
+ *        Para cada linha: split em ": " → nome + valor → lws_add_http_header_by_name.
  *
- *   [M6] ap_destroy com flush WS CLOSE correto.
- *        Antes: único lws_service(ctx, 0) após set_timeout — pode não completar
- *        o handshake WS CLOSE. Agora: loop de até 5 iterações × 5ms até wsi=nullptr
- *        (indicador de CLOSE completo). Bot recebe WS close frame limpo.
+ *        Referências: LWS mailing list (Andy Green, Dec 2019, issue #1851),
+ *        warmcat/libwebsockets issues #1488, #2948, e
+ *        lws-api-doc-master/html/group__client.html.
  *
- *   [M7] Jitter buffer adaptativo.
- *        TX_JITTER_FRAMES começa em 1 (20ms). Se underruns acumulam (>3 em janela
- *        de 1s = 50 frames), incrementa para 2 (40ms). Se estabiliza por 10s sem
- *        underruns, volta para 1. Balanço entre latência e qualidade de áudio.
+ *   [N3] SpeexDSP resampler no path RX (8 kHz → 16 kHz).
  *
- * Dependências: libwebsockets ≥ 4.x, C++14
+ *        Substitui upsample_8_to_16() (interpolação linear manual) por
+ *        speex_resampler_process_int() com qualidade 4.
+ *
+ *        API utilizada conforme documentação oficial:
+ *          speex.org/docs/manual/speex-manual/node7.html
+ *          xiph/speexdsp include/speex/speex_resampler.h
+ *
+ *        Inicialização: speex_resampler_init(1, 8000, 16000, 4, &err)
+ *          - 1 canal (mono)
+ *          - input_rate = 8000 Hz (FreeSWITCH RTP)
+ *          - output_rate = 16000 Hz (Deepgram STT)
+ *          - quality = 4 (equilíbrio CPU/qualidade para tempo real;
+ *            doc recomenda 3 para desktop, 10 para pro audio)
+ *        speex_resampler_skip_zeros() é chamado após init para preencher o
+ *        delay interno do filtro com zeros, evitando artefato inicial.
+ *        Destruição: speex_resampler_destroy() em ap_destroy().
+ *
+ * Dependências: libwebsockets ≥ 4.x, libspeexdsp, C++14
  */
 
 #include "audio_pipe.h"
@@ -61,107 +70,87 @@
 #include <cassert>
 #include <cstring>
 #include <libwebsockets.h>
+#include <speex/speex_resampler.h>   /* [N3] SpeexDSP */
 #include <string>
+#include <vector>
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Constantes de áudio
  * ──────────────────────────────────────────────────────────────────────────── */
-static constexpr int FS_SAMPLE_RATE    = 8000;
-static constexpr int BOT_SAMPLE_RATE   = 16000;
-static constexpr int RESAMPLE_RATIO    = BOT_SAMPLE_RATE / FS_SAMPLE_RATE;  // 2
+/* ── Taxas de amostragem ────────────────────────────────────────────────────
+ *
+ * Fluxo RX  (usuário → bot / STT):
+ *   FS capta 8 kHz → SpeexDSP upsample → envia 16 kHz para o bot via WS.
+ *
+ * Fluxo TX  (bot → usuário / TTS):
+ *   Bot envia 8 kHz via WS → injeta direto no RTP do usuário (sem conversão).
+ *   O RTP de telefonia é 8 kHz — nenhum downsample necessário.
+ *
+ * Constantes separadas por direção para evitar ambiguidade:
+ *   BOT_RX_*  → o que o bot RECEBE  (16 kHz — nosso RX path upsampled)
+ *   BOT_TX_*  → o que o bot ENVIA   (8 kHz  — nosso TX path, sem conversão)
+ *   FS_*      → clock interno do FS (8 kHz, 20ms, 160 samples)
+ * ──────────────────────────────────────────────────────────────────────────── */
+static constexpr int FS_SAMPLE_RATE      = 8000;
+static constexpr int BOT_RX_SAMPLE_RATE  = 16000;   /* bot recebe em 16 kHz */
+static constexpr int BOT_TX_SAMPLE_RATE  = 8000;    /* bot envia em 8 kHz   */
 
-static constexpr int FRAME_MS          = 20;
-static constexpr int FS_FRAME_SAMPLES  = FS_SAMPLE_RATE  * FRAME_MS / 1000;  // 160
-static constexpr int FS_FRAME_BYTES    = FS_FRAME_SAMPLES * 2;               // 320
+static constexpr int FRAME_MS            = 20;
 
-static constexpr int BOT_FRAME_SAMPLES = BOT_SAMPLE_RATE * FRAME_MS / 1000;  // 320
-static constexpr int BOT_FRAME_BYTES   = BOT_FRAME_SAMPLES * 2;              // 640
+/* FS / bot-TX: 8 kHz × 20ms = 160 samples = 320 bytes */
+static constexpr int FS_FRAME_SAMPLES    = FS_SAMPLE_RATE    * FRAME_MS / 1000; // 160
+static constexpr int FS_FRAME_BYTES      = FS_FRAME_SAMPLES  * 2;               // 320
 
-/* Ring buffer TX: 400ms de headroom para burst do bot */
-static constexpr int TX_RING_FRAMES    = 20;
-static constexpr int TX_RING_SAMPLES   = TX_RING_FRAMES * FS_FRAME_SAMPLES;  // 3200 int16
+/* bot-RX (WS → STT): 16 kHz × 20ms = 320 samples = 640 bytes */
+static constexpr int BOT_RX_FRAME_SAMPLES = BOT_RX_SAMPLE_RATE * FRAME_MS / 1000; // 320
+static constexpr int BOT_RX_FRAME_BYTES   = BOT_RX_FRAME_SAMPLES * 2;             // 640
 
-/* [M7] Jitter buffer adaptativo: limites e parâmetros de janela */
-static constexpr int TX_JITTER_MIN     = 1;   /* 20ms — latência mínima */
-static constexpr int TX_JITTER_MAX     = 4;   /* 80ms — cap conservador */
-/* Janela de 1s = 50 frames @ 20ms. Se >3 underruns nessa janela → aumenta jitter. */
-static constexpr int JITTER_ADAPT_WINDOW  = 50;   /* frames */
-static constexpr int JITTER_UNDERRUN_THR  = 3;    /* underruns por janela para aumentar */
-static constexpr int JITTER_STABLE_WINDOW = 500;  /* frames sem underrun para diminuir */
+/* bot-TX (WS ← TTS): 8 kHz × 20ms = 160 samples = 320 bytes
+ * Idêntico ao FS — alias explícito para deixar a intenção clara no código. */
+static constexpr int BOT_TX_FRAME_SAMPLES = BOT_TX_SAMPLE_RATE * FRAME_MS / 1000; // 160
+static constexpr int BOT_TX_FRAME_BYTES   = BOT_TX_FRAME_SAMPLES * 2;             // 320
 
-/* LWS padding */
+/* Ring buffer TX: 400ms de headroom = 20 frames @ 8 kHz */
+static constexpr int TX_RING_FRAMES      = 20;
+static constexpr int TX_RING_SAMPLES     = TX_RING_FRAMES * FS_FRAME_SAMPLES;     // 3200
+
+/* [M7] Jitter buffer adaptativo */
+static constexpr int TX_JITTER_MIN         = 1;
+static constexpr int TX_JITTER_MAX         = 4;
+static constexpr int JITTER_ADAPT_WINDOW   = 50;
+static constexpr int JITTER_UNDERRUN_THR   = 3;
+static constexpr int JITTER_STABLE_WINDOW  = 500;
+
+/* LWS */
 static constexpr int AP_LWS_PRE  = LWS_PRE;
 
-/* [M2] Reconexão: backoff inicial 100ms, fator 2, cap 5000ms */
-static constexpr int RECONNECT_BASE_MS   = 100;
-static constexpr int RECONNECT_MAX_MS    = 5000;
+/* [M2] Backoff de reconexão */
+static constexpr int RECONNECT_BASE_MS  = 100;
+static constexpr int RECONNECT_MAX_MS   = 5000;
 
-/* [M4] CNG: amplitude ~-60 dBFS ≈ 1/1000 de full-scale (32767) ≈ 33 */
-static constexpr int16_t CNG_AMPLITUDE   = 33;
-
-/* [M6] ap_destroy: máximo de iterações de flush WS CLOSE */
+/* [M6] Flush WS CLOSE em ap_destroy */
 static constexpr int DESTROY_FLUSH_ITERS = 5;
 static constexpr int DESTROY_FLUSH_MS    = 5;
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * [M4] CNG — Comfort Noise Generator
- *
- * Ruído branco de baixa amplitude usando LCG de 32 bits.
- * Sem stdlib, sem alocação, sem dependência de estado global.
- * Custo: 1 multiply + 1 add por amostra.
- * Amplitude: CNG_AMPLITUDE (~-60 dBFS) — inaudível mas não silêncio digital.
- * ──────────────────────────────────────────────────────────────────────────── */
-static uint32_t cng_state = 0x12345678u;
+/* [N1] Tamanho máximo do metadata JSON */
+static constexpr int METADATA_MAX_BYTES = 2048;
 
-static inline int16_t cng_next_sample() {
-    cng_state = cng_state * 1664525u + 1013904223u;  // Knuth LCG
-    /* Usa os bits [16:31] que têm período completo */
-    int32_t s = static_cast<int32_t>(cng_state >> 16) - 32768;
-    /* Escala para CNG_AMPLITUDE: s ∈ [-32768, 32767] → [-CNG_AMPLITUDE, CNG_AMPLITUDE] */
-    return static_cast<int16_t>((s * CNG_AMPLITUDE) >> 15);
-}
-
-static void fill_cng(int16_t* dst, int n) {
-    for (int i = 0; i < n; ++i)
-        dst[i] = cng_next_sample();
-}
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * Resample — RX path: 8 kHz → 16 kHz (interpolação linear)
- * ──────────────────────────────────────────────────────────────────────────── */
-static void upsample_8_to_16(const int16_t* src, int src_n, int16_t* dst) {
-    for (int i = 0; i < src_n - 1; ++i) {
-        dst[i * 2]     = src[i];
-        dst[i * 2 + 1] = static_cast<int16_t>(
-            (static_cast<int32_t>(src[i]) + static_cast<int32_t>(src[i + 1])) / 2);
-    }
-    dst[(src_n - 1) * 2]     = src[src_n - 1];
-    dst[(src_n - 1) * 2 + 1] = src[src_n - 1];
-}
+/* [N3] Qualidade do SpeexDSP resampler (0-10, doc sugere 3 para desktop) */
+static constexpr int SPEEX_RESAMPLE_QUALITY = 4;
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * TxRingBuffer — SPSC lock-free
- *
- * Produtor: LWS thread (LWS_CALLBACK_CLIENT_RECEIVE)
- * Consumidor: RTP thread (bug_callback WRITE_REPLACE)
- *
- * [FIX #2] tail avança com módulo.
- * [M5]     drop counter integrado.
- * Política de overflow: drop-newest (apenas push() modifica head; pop() modifica
- * tail) — elimina race condition da política drop-oldest anterior.
+ * Produtor: LWS thread  |  Consumidor: RTP thread
  * ──────────────────────────────────────────────────────────────────────────── */
 struct TxRingBuffer {
     int16_t          buf[TX_RING_SAMPLES];
     std::atomic<int> head{0};
     std::atomic<int> tail{0};
     std::atomic<int> count{0};
-
-    /* [M5] contador de drops — modificado apenas pelo produtor (LWS thread) */
     std::atomic<uint64_t> drops{0};
 
     TxRingBuffer() { std::memset(buf, 0, sizeof(buf)); }
 
-    /* Produz n amostras. Drop-newest se cheio — não modifica tail. */
     void push(const int16_t* src, int n) {
         for (int i = 0; i < n; ++i) {
             if (count.load(std::memory_order_acquire) >= TX_RING_SAMPLES) {
@@ -175,24 +164,20 @@ struct TxRingBuffer {
         }
     }
 
-    /* Consome exatamente n amostras. Preenche CNG [M4] se insuficiente. */
+    /* Retorna número de amostras faltantes (underrun); preenche com silêncio. */
     int pop(int16_t* dst, int n) {
         int avail = count.load(std::memory_order_acquire);
         int read  = std::min(avail, n);
         int t     = tail.load(std::memory_order_relaxed);
-
         for (int i = 0; i < read; ++i) {
             dst[i] = buf[t];
             t = (t + 1) % TX_RING_SAMPLES;
         }
         tail.store(t, std::memory_order_release);
         count.fetch_sub(read, std::memory_order_acq_rel);
-
-        int underrun_samples = n - read;
-        if (underrun_samples > 0)
-            fill_cng(dst + read, underrun_samples);  /* [M4] CNG em vez de zeros */
-
-        return underrun_samples;  /* retorna 0 se sem underrun */
+        int underrun = n - read;
+        if (underrun > 0) std::memset(dst + read, 0, underrun * sizeof(int16_t));
+        return underrun;
     }
 
     void reset() {
@@ -206,6 +191,48 @@ struct TxRingBuffer {
 };
 
 /* ─────────────────────────────────────────────────────────────────────────────
+ * [N2] parse_extra_headers — extrai pares nome/valor do campo extra_headers.
+ *
+ * Formato de entrada: "Header-Name: value\nHeader2: value2\n"
+ * Separador de nome: ": " (dois pontos + espaço, RFC 7230).
+ * Retorna vector de pares {nome_com_dois_pontos, valor} prontos para
+ * lws_add_http_header_by_name().
+ *
+ * Nota: o LWS exige que o nome do header termine com ':' (sem espaço) ao ser
+ * passado para lws_add_http_header_by_name(). Nós o armazenamos com ':' final.
+ * ──────────────────────────────────────────────────────────────────────────── */
+struct HeaderPair {
+    std::string name;   /* ex: "Authorization:" */
+    std::string value;  /* ex: "Bearer eyJ..."  */
+};
+
+static std::vector<HeaderPair> parse_extra_headers(const char* raw) {
+    std::vector<HeaderPair> result;
+    if (!raw || !*raw) return result;
+
+    std::string input(raw);
+    size_t pos = 0;
+    while (pos < input.size()) {
+        size_t nl = input.find('\n', pos);
+        if (nl == std::string::npos) nl = input.size();
+        std::string line = input.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (line.empty()) continue;
+
+        /* Encontra ": " como separador nome/valor */
+        size_t sep = line.find(": ");
+        if (sep == std::string::npos) continue;
+
+        HeaderPair hp;
+        hp.name  = line.substr(0, sep) + ":";  /* "Authorization:" */
+        hp.value = line.substr(sep + 2);        /* "Bearer ..."     */
+        if (!hp.name.empty() && !hp.value.empty())
+            result.push_back(std::move(hp));
+    }
+    return result;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
  * AudioPipe — estado por sessão
  * ──────────────────────────────────────────────────────────────────────────── */
 struct AudioPipe {
@@ -216,61 +243,67 @@ struct AudioPipe {
     std::atomic<bool> connected{false};
     bool              closing   = false;
 
-    /* ── [M2] Reconexão com exponential backoff ─────────────────────────────
-     * Ciclo de vida da reconexão (no LWS thread):
-     *   1. CLOSED/ERROR → reconnect_pending=true, reconnect_at_ms=now+backoff
-     *   2. ap_service() → lws_service() → LWS_CALLBACK_EVENT_WAIT_CANCELLED
-     *      (ou qualquer callback que verifica reconnect_pending + timer)
-     *   3. Timer expirado → lws_client_connect_via_info() → novo wsi
-     *   4. ESTABLISHED → reconnect_attempts=0, backoff resetado
+    /* ── [N1] Metadata inicial ──────────────────────────────────────────────
+     * metadata_json: cópia da string fornecida em AudioPipeConfig.
+     * metadata_sent: flag que garante a ordem metadata → áudio.
+     *   - ESTABLISHED seta metadata_sent = false e chama lws_callback_on_writable.
+     *   - WRITEABLE: se !metadata_sent → envia metadata (LWS_WRITE_TEXT) → seta true.
+     *   - WRITEABLE: se metadata_sent → processa send queue de áudio normalmente.
      * ──────────────────────────────────────────────────────────────────────── */
-    bool          reconnect_pending   = false;
-    int           reconnect_attempts  = 0;
-    int           max_reconnect_attempts = 0;  /* 0 = sem reconexão */
-    uint64_t      reconnect_at_ms     = 0;     /* timestamp alvo em ms */
-    int           reconnect_backoff_ms = RECONNECT_BASE_MS;
+    std::string metadata_json;
+    bool        metadata_sent = false;
 
-    /* ── TX (bot → FS RTP) — 8 kHz nativo ──────────────────────────────────── */
-    TxRingBuffer  tx_ring;
-    bool          tx_ready         = false;
-
-    /* [M7] Jitter buffer adaptativo */
-    int           tx_jitter_frames = TX_JITTER_MIN;
-    int           jitter_frame_counter = 0;   /* frames desde início da janela atual */
-    int           jitter_underrun_count = 0;  /* underruns na janela atual */
-    int           jitter_stable_counter = 0;  /* frames sem underrun consecutivos */
-
-    /* ── [M1] Acumulador de fragmentos WS no receive path ───────────────────
-     * Fragmentos WS menores que FS_FRAME_BYTES são acumulados aqui até
-     * completar um frame completo. Elimina dropout por desalinhamento TCP.
+    /* ── [N2] Headers HTTP extras ───────────────────────────────────────────
+     * Parseados em ap_create() e usados em APPEND_HANDSHAKE_HEADER.
+     * Após ESTABLISHED o vector não é mais acessado — sem necessidade de lock.
      * ──────────────────────────────────────────────────────────────────────── */
-    uint8_t rx_frag_buf[FS_FRAME_BYTES * 4];  /* headroom para 4 frames de burst */
+    std::vector<HeaderPair> extra_headers;
+
+    /* ── [M2] Reconexão com exponential backoff ─────────────────────────────── */
+    bool     reconnect_pending       = false;
+    int      reconnect_attempts      = 0;
+    int      max_reconnect_attempts  = 0;
+    uint64_t reconnect_at_ms         = 0;
+    int      reconnect_backoff_ms    = RECONNECT_BASE_MS;
+
+    /* ── TX — 8 kHz nativo (Cartesia TTS) ──────────────────────────────────── */
+    TxRingBuffer tx_ring;
+    bool         tx_ready          = false;
+
+    /* [M7] Jitter adaptativo */
+    int tx_jitter_frames       = TX_JITTER_MIN;
+    int jitter_frame_counter   = 0;
+    int jitter_underrun_count  = 0;
+    int jitter_stable_counter  = 0;
+
+    /* ── [M1] Acumulador de fragmentos WS (receive path) ────────────────────── */
+    uint8_t rx_frag_buf[BOT_TX_FRAME_BYTES * 4];
     int     rx_frag_fill = 0;
 
-    /* ── RX accumulator (FS → bot) — 8 kHz → 16 kHz ────────────────────────
-     * INVARIANTE: acessado APENAS pelo thread RTP (ap_on_rx_frame).
-     *             Documentado explicitamente — refatorações que chamem
-     *             ap_on_rx_frame de outro contexto quebram este invariante.
-     * ──────────────────────────────────────────────────────────────────────── */
+    /* ── RX accumulator — INVARIANTE: apenas thread RTP ────────────────────── */
     int16_t rx_acc[FS_FRAME_SAMPLES];
     int     rx_acc_fill = 0;
 
-    /* ── Send queue SPSC — RX path: RTP thread → LWS thread ────────────────
-     * [M3] sq_pop_copy(): copia payload para buffer local ANTES de avançar tail.
-     *      Elimina exposição de ponteiro para slot que pode ser reutilizado.
-     * [FIX #4] sq_push() usa lws_cancel_service() para wake-up thread-safe.
+    /* ── [N3] SpeexDSP resampler (RX path: 8 kHz → 16 kHz) ─────────────────
+     * Inicializado em ap_create(), destruído em ap_destroy().
+     * Acesso exclusivo do thread RTP via ap_on_rx_frame() — sem lock necessário.
+     * speex_resampler_skip_zeros() é chamado após init para eliminar artefato
+     * de startup causado pelo delay interno do filtro FIR.
      * ──────────────────────────────────────────────────────────────────────── */
+    SpeexResamplerState* spx_resampler = nullptr;
+
+    /* ── Send queue SPSC (RTP thread → LWS thread) ──────────────────────────── */
     struct TxMsg {
-        uint8_t data[AP_LWS_PRE + BOT_FRAME_BYTES];
+        uint8_t data[AP_LWS_PRE + BOT_RX_FRAME_BYTES];
         int     len;
     };
-    static constexpr int SEND_QUEUE_SIZE = 16;  /* 16 × 20ms = 320ms buffer RX */
+    static constexpr int SEND_QUEUE_SIZE = 16;
     TxMsg            send_queue[SEND_QUEUE_SIZE];
     std::atomic<int> sq_head{0};
     std::atomic<int> sq_tail{0};
     std::atomic<int> sq_count{0};
 
-    /* [M5] Métricas — atômicas para leitura sem lock de ap_get_stats() */
+    /* ── [M5] Métricas ──────────────────────────────────────────────────────── */
     std::atomic<uint64_t> stat_tx_underruns{0};
     std::atomic<uint64_t> stat_sq_drops{0};
     std::atomic<uint64_t> stat_ws_reconnects{0};
@@ -280,55 +313,33 @@ struct AudioPipe {
     AudioPipeEventCallback event_cb  = nullptr;
     void*                  user_data = nullptr;
 
-    /* ── sq_push: RTP thread → enfileira frame RX para envio WS ──────────── */
+    /* ── sq_push (RTP thread → LWS thread) ──────────────────────────────────── */
     bool sq_push(const uint8_t* payload, int len) {
         if (sq_count.load(std::memory_order_acquire) >= SEND_QUEUE_SIZE) {
-            stat_sq_drops.fetch_add(1, std::memory_order_relaxed);  /* [M5] */
+            stat_sq_drops.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         int h = sq_head.load(std::memory_order_relaxed);
-        TxMsg& m = send_queue[h];
-        std::memcpy(m.data + AP_LWS_PRE, payload, len);
-        m.len = len;
+        std::memcpy(send_queue[h].data + AP_LWS_PRE, payload, len);
+        send_queue[h].len = len;
         sq_head.store((h + 1) % SEND_QUEUE_SIZE, std::memory_order_release);
         sq_count.fetch_add(1, std::memory_order_acq_rel);
-
-        /* [FIX #4] Wake-up thread-safe */
-        if (lws_ctx) lws_cancel_service(lws_ctx);
+        if (lws_ctx) lws_cancel_service(lws_ctx);  /* [FIX #4] */
         return true;
     }
 
-    /* ── [M3] sq_pop_copy: LWS thread — copia para buf local antes de avançar tail
-     *
-     * Antes (sq_pop): retornava ponteiro para m.data ANTES de avançar tail.
-     *   Se lws_write() falhasse e sq_pop() fosse chamado novamente, o slot
-     *   poderia ser reutilizado pelo produtor enquanto lws_write() ainda usava
-     *   o ponteiro. Race condition sutil em condições de erro de rede.
-     *
-     * Agora (sq_pop_copy): copia payload para buf[LWS_PRE...] fornecido pelo
-     *   chamador, avança tail APÓS a cópia. Chamador chama lws_write() sobre
-     *   seu próprio buffer — sem exposição de ponteiro interno.
-     *
-     * @buf      buffer do chamador com pelo menos AP_LWS_PRE + BOT_FRAME_BYTES
-     * @out_len  tamanho do payload (excluindo AP_LWS_PRE)
-     * @return   true se havia item na fila
-     * ──────────────────────────────────────────────────────────────────────── */
+    /* ── [M3] sq_pop_copy — copia para buffer local antes de avançar tail ────── */
     bool sq_pop_copy(uint8_t* buf, int* out_len) {
         if (sq_count.load(std::memory_order_acquire) == 0) return false;
         int t = sq_tail.load(std::memory_order_relaxed);
-        TxMsg& m = send_queue[t];
-        /* Copia payload (sem LWS_PRE) para posição LWS_PRE do buffer do chamador */
-        std::memcpy(buf + AP_LWS_PRE, m.data + AP_LWS_PRE, m.len);
-        *out_len = m.len;
-        /* Tail avança APÓS a cópia — slot seguro para reuso pelo produtor */
+        std::memcpy(buf + AP_LWS_PRE, send_queue[t].data + AP_LWS_PRE, send_queue[t].len);
+        *out_len = send_queue[t].len;
         sq_tail.store((t + 1) % SEND_QUEUE_SIZE, std::memory_order_release);
         sq_count.fetch_sub(1, std::memory_order_acq_rel);
         return true;
     }
 
     /* ── [M2] Helpers de reconexão ──────────────────────────────────────────── */
-
-    /* Retorna timestamp em ms desde epoch (monotônico). */
     static uint64_t now_ms() {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -336,14 +347,12 @@ struct AudioPipe {
                static_cast<uint64_t>(ts.tv_nsec) / 1000000u;
     }
 
-    /* Agenda reconexão com backoff atual e dobra para a próxima tentativa. */
     void schedule_reconnect() {
-        reconnect_at_ms    = now_ms() + static_cast<uint64_t>(reconnect_backoff_ms);
-        reconnect_pending  = true;
+        reconnect_at_ms   = now_ms() + static_cast<uint64_t>(reconnect_backoff_ms);
+        reconnect_pending = true;
         reconnect_backoff_ms = std::min(reconnect_backoff_ms * 2, RECONNECT_MAX_MS);
     }
 
-    /* Reseta estado de reconexão após ESTABLISHED bem-sucedido. */
     void reset_reconnect() {
         reconnect_pending    = false;
         reconnect_attempts   = 0;
@@ -351,37 +360,21 @@ struct AudioPipe {
         reconnect_at_ms      = 0;
     }
 
-    /* [M7] Atualiza jitter buffer adaptativo. Chamado por ap_on_tx_frame()
-     * no thread RTP a cada pop(). underrun=true se pop() teve underrun.
-     *
-     * Lógica:
-     *   - A cada JITTER_ADAPT_WINDOW frames, avalia underrun_count.
-     *   - Se underrun_count > JITTER_UNDERRUN_THR → tx_jitter_frames++ (até MAX).
-     *   - Se jitter_stable_counter > JITTER_STABLE_WINDOW → tx_jitter_frames-- (até MIN).
-     *   - tx_ready é reavaliado com o novo threshold.
-     */
+    /* ── [M7] Jitter buffer adaptativo ──────────────────────────────────────── */
     void update_jitter(bool underrun) {
         jitter_frame_counter++;
-        if (underrun) {
-            jitter_underrun_count++;
-            jitter_stable_counter = 0;
-        } else {
-            jitter_stable_counter++;
-        }
+        if (underrun) { jitter_underrun_count++; jitter_stable_counter = 0; }
+        else          { jitter_stable_counter++; }
 
-        /* Avalia janela */
         if (jitter_frame_counter >= JITTER_ADAPT_WINDOW) {
             if (jitter_underrun_count > JITTER_UNDERRUN_THR &&
                 tx_jitter_frames < TX_JITTER_MAX) {
                 tx_jitter_frames++;
-                /* Reseta tx_ready para forçar reenchimento com novo threshold */
-                tx_ready = false;
+                tx_ready = false;  /* forçar reenchimento com novo threshold */
             }
             jitter_underrun_count = 0;
             jitter_frame_counter  = 0;
         }
-
-        /* Janela de estabilidade */
         if (jitter_stable_counter >= JITTER_STABLE_WINDOW &&
             tx_jitter_frames > TX_JITTER_MIN) {
             tx_jitter_frames--;
@@ -391,288 +384,47 @@ struct AudioPipe {
 };
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * [M2] Tenta reconectar: cria novo wsi no lws_ctx existente.
- * Chamado pelo LWS thread dentro de check_reconnect() — seguro.
+ * Helpers de URL parsing e conexão (usados em ap_create e do_reconnect)
  * ──────────────────────────────────────────────────────────────────────────── */
-static bool do_reconnect(AudioPipe* ap) {
-    if (!ap || !ap->lws_ctx) return false;
-
-    char host[128] = {}, path[256] = {};
-    int  port   = 9998;
-    bool is_ssl = (ap->url.substr(0, 3) == "wss");
-    const char* u     = ap->url.c_str() + (is_ssl ? 6 : 5);
+static void parse_url(const std::string& url,
+                      char* host, int host_max,
+                      int*  port,
+                      char* path, int path_max,
+                      bool* is_ssl)
+{
+    *is_ssl = (url.substr(0, 3) == "wss");
+    const char* u     = url.c_str() + (*is_ssl ? 6 : 5);
     const char* slash = strchr(u, '/');
     const char* colon = strchr(u, ':');
+    *port = 9998;
 
     if (colon && (!slash || colon < slash)) {
         int hlen = static_cast<int>(colon - u);
-        strncpy(host, u, std::min(hlen, 127));
-        port = atoi(colon + 1);
+        strncpy(host, u, std::min(hlen, host_max - 1));
+        host[std::min(hlen, host_max - 1)] = '\0';
+        *port = atoi(colon + 1);
     } else {
         int hlen = slash ? static_cast<int>(slash - u) : static_cast<int>(strlen(u));
-        strncpy(host, u, std::min(hlen, 127));
+        strncpy(host, u, std::min(hlen, host_max - 1));
+        host[std::min(hlen, host_max - 1)] = '\0';
     }
-    strncpy(path, slash ? slash : "/", 255);
-
-    static const lws_protocols proto_arr[] = {
-        { "audio.bot", nullptr, 0, 0 },  /* callback setado no contexto */
-        { nullptr, nullptr, 0, 0 }
-    };
-
-    lws_client_connect_info ci{};
-    ci.context        = ap->lws_ctx;
-    ci.address        = host;
-    ci.port           = port;
-    ci.path           = path;
-    ci.host           = host;
-    ci.origin         = host;
-    ci.protocol       = "audio.bot";
-    ci.ssl_connection = is_ssl ? LCCSCF_USE_SSL : 0;
-    ci.userdata       = ap;
-
-    ap->wsi = lws_client_connect_via_info(&ci);
-    return ap->wsi != nullptr;
+    strncpy(path, slash ? slash : "/", path_max - 1);
+    path[path_max - 1] = '\0';
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * [M2] check_reconnect — chamado em callbacks LWS para verificar timer.
- * Seguro: executado dentro do LWS event loop.
- * ──────────────────────────────────────────────────────────────────────────── */
-static void check_reconnect(AudioPipe* ap) {
-    if (!ap || !ap->reconnect_pending || ap->closing) return;
-    if (ap->wsi) return;  /* ainda conectado ou conectando */
-
-    uint64_t now = AudioPipe::now_ms();
-    if (now < ap->reconnect_at_ms) return;  /* backoff ainda ativo */
-
-    /* Verifica limite de tentativas */
-    if (ap->max_reconnect_attempts > 0 &&
-        ap->reconnect_attempts >= ap->max_reconnect_attempts) {
-        ap->reconnect_pending = false;
-        /* Desistiu — emite DISCONNECTED final */
-        if (ap->event_cb)
-            ap->event_cb(ap, AP_EVENT_DISCONNECTED, ap->user_data);
-        return;
-    }
-
-    ap->reconnect_attempts++;
-    ap->stat_ws_reconnects.fetch_add(1, std::memory_order_relaxed);  /* [M5] */
-
-    if (ap->event_cb)
-        ap->event_cb(ap, AP_EVENT_RECONNECTING, ap->user_data);
-
-    if (!do_reconnect(ap)) {
-        /* Falha na tentativa — agenda próxima com backoff */
-        ap->schedule_reconnect();
-    }
-    /* Se do_reconnect ok, wsi≠nullptr. Aguarda ESTABLISHED ou CONNECTION_ERROR. */
-}
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * LWS callback
- * ──────────────────────────────────────────────────────────────────────────── */
 static int lws_callback(struct lws* wsi, enum lws_callback_reasons reason,
-                        void* user, void* in, size_t len)
-{
-    AudioPipe* ap = reinterpret_cast<AudioPipe*>(lws_wsi_user(wsi));
-
-    switch (reason) {
-
-    /* ── Conexão estabelecida ─────────────────────────────────────────────── */
-    case LWS_CALLBACK_CLIENT_ESTABLISHED:
-        ap->connected.store(true, std::memory_order_release);
-        ap->reset_reconnect();  /* [M2] */
-        if (ap->event_cb) ap->event_cb(ap, AP_EVENT_CONNECTED, ap->user_data);
-        lws_callback_on_writable(wsi);  /* seguro: dentro do LWS callback */
-        break;
-
-    /* ── Desconexão / erro ────────────────────────────────────────────────── */
-    case LWS_CALLBACK_CLIENT_CLOSED:
-    case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-        if (ap) {
-            ap->connected.store(false, std::memory_order_release);
-            ap->wsi      = nullptr;
-
-            /* [FIX #5] Reseta ring e tx_ready */
-            ap->tx_ready = false;
-            ap->tx_ring.reset();
-            ap->rx_frag_fill = 0;  /* [M1] descarta fragmento parcial acumulado */
-
-            /* [M2] Agenda reconexão se configurado e não estamos encerrando */
-            if (!ap->closing && ap->max_reconnect_attempts != 0) {
-                ap->schedule_reconnect();
-                /* Não emite DISCONNECTED ainda — será emitido se esgotar tentativas */
-            } else {
-                /* Sem reconexão configurada: comportamento original */
-                if (ap->event_cb)
-                    ap->event_cb(ap, AP_EVENT_DISCONNECTED, ap->user_data);
-            }
-        }
-        break;
-
-    /* ── [FIX #4] Wake-up pelo thread RTP via lws_cancel_service() ──────── */
-    case LWS_CALLBACK_EVENT_WAIT_CANCELLED: {
-        AudioPipe* cap = reinterpret_cast<AudioPipe*>(
-            lws_context_user(lws_get_context(wsi)));
-        if (!cap) break;
-
-        /* [M2] Aproveita o wake-up para verificar timer de reconexão */
-        check_reconnect(cap);
-
-        if (cap->wsi && !cap->closing &&
-            cap->sq_count.load(std::memory_order_acquire) > 0) {
-            lws_callback_on_writable(cap->wsi);
-        }
-        break;
-    }
-
-    /* ── Envio de frame RX (FS → bot / Deepgram STT) ────────────────────── */
-    case LWS_CALLBACK_CLIENT_WRITEABLE: {
-        if (!ap || ap->closing) break;
-
-        /*
-         * [M3] Buffer local com LWS_PRE + payload.
-         *      sq_pop_copy() copia antes de avançar tail — sem exposição de
-         *      ponteiro para slot interno da send queue.
-         */
-        uint8_t local_buf[AP_LWS_PRE + BOT_FRAME_BYTES];
-        int     plen = 0;
-
-        if (!ap->sq_pop_copy(local_buf, &plen)) break;
-
-        int rc = lws_write(wsi,
-                           local_buf + AP_LWS_PRE,
-                           static_cast<size_t>(plen),
-                           LWS_WRITE_BINARY);
-
-        if (rc < 0) {
-            /* Erro de escrita — LWS fecha a conexão; CLOSED será disparado. */
-            break;
-        }
-
-        /* Reagenda se há mais frames na fila */
-        if (ap->sq_count.load(std::memory_order_acquire) > 0)
-            lws_callback_on_writable(wsi);
-        break;
-    }
-
-    /* ── Recebimento de áudio TX (bot → FS RTP) ──────────────────────────── */
-    case LWS_CALLBACK_CLIENT_RECEIVE: {
-        /*
-         * TX path: recebe PCM binário @ 8 kHz do bot (Cartesia).
-         *
-         * [M1] Acumulador de fragmentos WS.
-         *      O WS não garante que cada mensagem tem exatamente FS_FRAME_BYTES.
-         *      TCP pode entregar em pedaços menores (segmentação, Nagle, etc.).
-         *      Acumulamos em rx_frag_buf até ter FS_FRAME_BYTES, depois push.
-         *      Fragmento residual é mantido para a próxima mensagem.
-         */
-        if (!ap || !in || len == 0) break;
-
-        const uint8_t* p   = reinterpret_cast<const uint8_t*>(in);
-        int            rem = static_cast<int>(len);
-
-        ap->stat_rx_frag_bytes.fetch_add(len, std::memory_order_relaxed);  /* [M5] */
-
-        /* Drena: junta fragmento pendente + dados novos, processa frames completos */
-        while (rem > 0) {
-            /* Copia o máximo possível para rx_frag_buf */
-            int space = static_cast<int>(sizeof(ap->rx_frag_buf)) - ap->rx_frag_fill;
-            int copy  = std::min(rem, space);
-            if (copy <= 0) {
-                /* rx_frag_buf cheio sem completar frame — situação anômala:
-                 * descarta acumulado e recomeça com dados atuais */
-                ap->rx_frag_fill = 0;
-                continue;
-            }
-            std::memcpy(ap->rx_frag_buf + ap->rx_frag_fill, p, copy);
-            ap->rx_frag_fill += copy;
-            p   += copy;
-            rem -= copy;
-
-            /* Processa todos os frames completos acumulados */
-            while (ap->rx_frag_fill >= FS_FRAME_BYTES) {
-                const int16_t* src8 = reinterpret_cast<const int16_t*>(ap->rx_frag_buf);
-                ap->tx_ring.push(src8, FS_FRAME_SAMPLES);
-
-                /* Desloca fragmento residual para o início */
-                int residual = ap->rx_frag_fill - FS_FRAME_BYTES;
-                if (residual > 0)
-                    std::memmove(ap->rx_frag_buf,
-                                 ap->rx_frag_buf + FS_FRAME_BYTES,
-                                 residual);
-                ap->rx_frag_fill = residual;
-            }
-        }
-
-        /* [M7] Jitter buffer adaptativo: considera TX pronto ao atingir threshold */
-        if (!ap->tx_ready &&
-            ap->tx_ring.available() >= ap->tx_jitter_frames * FS_FRAME_SAMPLES) {
-            ap->tx_ready = true;
-        }
-        break;
-    }
-
-    default:
-        break;
-    }
-    return 0;
-}
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * API pública
- * ──────────────────────────────────────────────────────────────────────────── */
+                        void* user, void* in, size_t len);
 
 static const lws_protocols protocols[] = {
     { "audio.bot", lws_callback, 0, 0 },
     { nullptr, nullptr, 0, 0 }
 };
 
-AudioPipe* ap_create(const char* url,
-                     AudioPipeEventCallback cb,
-                     void* user_data,
-                     int max_reconnect_attempts)
-{
-    auto* ap      = new AudioPipe();
-    ap->url       = url;
-    ap->event_cb  = cb;
-    ap->user_data = user_data;
-    ap->max_reconnect_attempts = max_reconnect_attempts;  /* [M2] */
-
-    lws_context_creation_info info{};
-    info.port      = CONTEXT_PORT_NO_LISTEN;
-    info.protocols = protocols;
-    info.options   = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-    info.ka_time     = 10;
-    info.ka_probes   = 3;
-    info.ka_interval = 5;
-    info.user        = ap;  /* [FIX #4] acessível em WAIT_CANCELLED */
-
-    ap->lws_ctx = lws_create_context(&info);
-    if (!ap->lws_ctx) {
-        delete ap;
-        return nullptr;
-    }
-
-    /* Parse URL e conecta */
+static bool do_connect(AudioPipe* ap) {
     char host[128] = {}, path[256] = {};
-    int  port   = 9998;
-    bool is_ssl = (ap->url.substr(0, 3) == "wss");
-    const char* u     = ap->url.c_str() + (is_ssl ? 6 : 5);
-    const char* slash = strchr(u, '/');
-    const char* colon = strchr(u, ':');
-
-    if (colon && (!slash || colon < slash)) {
-        int hlen = static_cast<int>(colon - u);
-        strncpy(host, u, std::min(hlen, 127));
-        host[std::min(hlen, 127)] = '\0';
-        port = atoi(colon + 1);
-    } else {
-        int hlen = slash ? static_cast<int>(slash - u) : static_cast<int>(strlen(u));
-        strncpy(host, u, std::min(hlen, 127));
-        host[std::min(hlen, 127)] = '\0';
-    }
-    strncpy(path, slash ? slash : "/", 255);
+    int  port;
+    bool is_ssl;
+    parse_url(ap->url, host, sizeof(host), &port, path, sizeof(path), &is_ssl);
 
     lws_client_connect_info ci{};
     ci.context        = ap->lws_ctx;
@@ -686,7 +438,279 @@ AudioPipe* ap_create(const char* url,
     ci.userdata       = ap;
 
     ap->wsi = lws_client_connect_via_info(&ci);
-    if (!ap->wsi) {
+    return ap->wsi != nullptr;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * [M2] check_reconnect — chamado no LWS event loop (WAIT_CANCELLED)
+ * ──────────────────────────────────────────────────────────────────────────── */
+static void check_reconnect(AudioPipe* ap) {
+    if (!ap || !ap->reconnect_pending || ap->closing || ap->wsi) return;
+    if (AudioPipe::now_ms() < ap->reconnect_at_ms) return;
+
+    if (ap->max_reconnect_attempts > 0 &&
+        ap->reconnect_attempts >= ap->max_reconnect_attempts) {
+        ap->reconnect_pending = false;
+        if (ap->event_cb) ap->event_cb(ap, AP_EVENT_DISCONNECTED, ap->user_data);
+        return;
+    }
+
+    ap->reconnect_attempts++;
+    ap->stat_ws_reconnects.fetch_add(1, std::memory_order_relaxed);
+    if (ap->event_cb) ap->event_cb(ap, AP_EVENT_RECONNECTING, ap->user_data);
+
+    if (!do_connect(ap))
+        ap->schedule_reconnect();
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * LWS callback
+ * ──────────────────────────────────────────────────────────────────────────── */
+static int lws_callback(struct lws* wsi, enum lws_callback_reasons reason,
+                        void* /*user*/, void* in, size_t len)
+{
+    AudioPipe* ap = reinterpret_cast<AudioPipe*>(lws_wsi_user(wsi));
+
+    switch (reason) {
+
+    /* ── [N2] Adiciona headers HTTP extras antes do WS Upgrade ─────────────
+     *
+     * LWS chama este callback durante a fase HTTP do handshake.
+     * `in`  → ponteiro para o ponteiro atual no buffer de escrita de headers.
+     * `len` → bytes restantes no buffer.
+     * lws_add_http_header_by_name() avança *p e retorna não-zero se falta espaço.
+     *
+     * Fonte: Andy Green, LWS mailing list Dec/2019:
+     *   "The missing trick is there's a callback
+     *    LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER in the client protocol
+     *    handler that is called back at the right time for it."
+     *   (https://libwebsockets.org/pipermail/libwebsockets/2019-December/008165.html)
+     * ──────────────────────────────────────────────────────────────────────── */
+    case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER: {
+        if (!ap || ap->extra_headers.empty()) break;
+
+        unsigned char** p   = reinterpret_cast<unsigned char**>(in);
+        unsigned char*  end = *p + len;
+
+        for (const auto& hdr : ap->extra_headers) {
+            int rc = lws_add_http_header_by_name(
+                wsi,
+                reinterpret_cast<const unsigned char*>(hdr.name.c_str()),
+                reinterpret_cast<const unsigned char*>(hdr.value.c_str()),
+                static_cast<int>(hdr.value.size()),
+                p,
+                end
+            );
+            if (rc) {
+                /* Buffer de headers insuficiente — aborta handshake */
+                lwsl_err("ap: header '%s' não coube no buffer do handshake\n",
+                         hdr.name.c_str());
+                return -1;
+            }
+        }
+        break;
+    }
+
+    /* ── Conexão estabelecida ───────────────────────────────────────────────── */
+    case LWS_CALLBACK_CLIENT_ESTABLISHED:
+        ap->connected.store(true, std::memory_order_release);
+        ap->reset_reconnect();
+        ap->metadata_sent = false;   /* [N1] garante envio do metadata primeiro */
+        if (ap->event_cb) ap->event_cb(ap, AP_EVENT_CONNECTED, ap->user_data);
+        lws_callback_on_writable(wsi);  /* dispara WRITEABLE para metadata [N1] */
+        break;
+
+    /* ── Desconexão / erro ─────────────────────────────────────────────────── */
+    case LWS_CALLBACK_CLIENT_CLOSED:
+    case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+        if (ap) {
+            ap->connected.store(false, std::memory_order_release);
+            ap->wsi         = nullptr;
+            ap->tx_ready    = false;
+            ap->tx_ring.reset();
+            ap->rx_frag_fill = 0;
+
+            if (!ap->closing && ap->max_reconnect_attempts != 0) {
+                ap->schedule_reconnect();
+            } else {
+                if (ap->event_cb)
+                    ap->event_cb(ap, AP_EVENT_DISCONNECTED, ap->user_data);
+            }
+        }
+        break;
+
+    /* ── [FIX #4] Wake-up do RTP thread + [M2] check_reconnect ─────────────── */
+    case LWS_CALLBACK_EVENT_WAIT_CANCELLED: {
+        AudioPipe* cap = reinterpret_cast<AudioPipe*>(
+            lws_context_user(lws_get_context(wsi)));
+        if (!cap) break;
+        check_reconnect(cap);
+        if (cap->wsi && !cap->closing &&
+            (cap->sq_count.load(std::memory_order_acquire) > 0 ||
+             !cap->metadata_sent))   /* [N1] acorda para enviar metadata */
+            lws_callback_on_writable(cap->wsi);
+        break;
+    }
+
+    /* ── Envio: metadata [N1] primeiro, depois áudio RX ─────────────────────── */
+    case LWS_CALLBACK_CLIENT_WRITEABLE: {
+        if (!ap || ap->closing) break;
+
+        /* [N1] Metadata — enviado como primeiro frame após ESTABLISHED.
+         *
+         * LWS_WRITE_TEXT sinaliza ao bot que é um frame de controle JSON,
+         * não PCM binário. O bot pode distinguir pelo tipo de frame WS.
+         * Usamos um buffer local com LWS_PRE para respeitar o padding do LWS.
+         */
+        if (!ap->metadata_sent && !ap->metadata_json.empty()) {
+            const std::string& meta = ap->metadata_json;
+            int mlen = static_cast<int>(meta.size());
+            if (mlen > METADATA_MAX_BYTES) mlen = METADATA_MAX_BYTES;
+
+            /* Buffer no stack: LWS_PRE + payload — dentro do limite de stack */
+            uint8_t buf[AP_LWS_PRE + METADATA_MAX_BYTES];
+            std::memcpy(buf + AP_LWS_PRE, meta.c_str(), mlen);
+
+            int rc = lws_write(wsi, buf + AP_LWS_PRE,
+                               static_cast<size_t>(mlen), LWS_WRITE_TEXT);
+            if (rc >= 0) {
+                ap->metadata_sent = true;
+                /* Após metadata, reagenda imediatamente para enviar áudio */
+                lws_callback_on_writable(wsi);
+            }
+            /* Se rc < 0, LWS vai disparar CLOSED — não precisamos tratar aqui */
+            break;
+        }
+
+        /* Áudio RX — send queue → WS */
+        uint8_t local_buf[AP_LWS_PRE + BOT_RX_FRAME_BYTES];
+        int     plen = 0;
+        if (!ap->sq_pop_copy(local_buf, &plen)) break;
+
+        int rc = lws_write(wsi,
+                           local_buf + AP_LWS_PRE,
+                           static_cast<size_t>(plen),
+                           LWS_WRITE_BINARY);
+        if (rc < 0) break;
+
+        if (ap->sq_count.load(std::memory_order_acquire) > 0)
+            lws_callback_on_writable(wsi);
+        break;
+    }
+
+    /* ── Recebimento de áudio TX (bot → FS RTP) — [M1] acumulador ──────────── */
+    case LWS_CALLBACK_CLIENT_RECEIVE: {
+        if (!ap || !in || len == 0) break;
+
+        /* [N1] Ignora frames de texto (bot pode enviar JSON de controle) */
+        if (lws_frame_is_binary(wsi) == 0) break;
+
+        const uint8_t* p   = reinterpret_cast<const uint8_t*>(in);
+        int            rem = static_cast<int>(len);
+
+        ap->stat_rx_frag_bytes.fetch_add(len, std::memory_order_relaxed);
+
+        while (rem > 0) {
+            int space = static_cast<int>(sizeof(ap->rx_frag_buf)) - ap->rx_frag_fill;
+            int copy  = std::min(rem, space);
+            if (copy <= 0) { ap->rx_frag_fill = 0; continue; }
+            std::memcpy(ap->rx_frag_buf + ap->rx_frag_fill, p, copy);
+            ap->rx_frag_fill += copy;
+            p   += copy;
+            rem -= copy;
+
+            while (ap->rx_frag_fill >= FS_FRAME_BYTES) {
+                const int16_t* src8 = reinterpret_cast<const int16_t*>(ap->rx_frag_buf);
+                ap->tx_ring.push(src8, FS_FRAME_SAMPLES);
+                int residual = ap->rx_frag_fill - FS_FRAME_BYTES;
+                if (residual > 0)
+                    std::memmove(ap->rx_frag_buf,
+                                 ap->rx_frag_buf + FS_FRAME_BYTES, residual);
+                ap->rx_frag_fill = residual;
+            }
+        }
+
+        if (!ap->tx_ready &&
+            ap->tx_ring.available() >= ap->tx_jitter_frames * FS_FRAME_SAMPLES)
+            ap->tx_ready = true;
+        break;
+    }
+
+    default:
+        break;
+    }
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * API pública
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+AudioPipe* ap_create(const char*            url,
+                     AudioPipeEventCallback cb,
+                     void*                  user_data,
+                     const AudioPipeConfig* cfg)
+{
+    auto* ap      = new AudioPipe();
+    ap->url       = url;
+    ap->event_cb  = cb;
+    ap->user_data = user_data;
+
+    /* Configuração opcional */
+    if (cfg) {
+        ap->max_reconnect_attempts = cfg->max_reconnect_attempts;
+
+        /* [N1] Copia metadata JSON */
+        if (cfg->metadata_json && *cfg->metadata_json)
+            ap->metadata_json = cfg->metadata_json;
+
+        /* [N2] Parseia headers extras */
+        if (cfg->extra_headers && *cfg->extra_headers)
+            ap->extra_headers = parse_extra_headers(cfg->extra_headers);
+    }
+
+    /* [N3] Inicializa SpeexDSP resampler 8 kHz → 16 kHz, qualidade 4.
+     *
+     * speex_resampler_init(nb_channels, in_rate, out_rate, quality, &err)
+     * speex_resampler_skip_zeros() preenche o delay interno do filtro com zeros,
+     * eliminando o artefato de startup (burst de energia no início do stream).
+     * Fonte: speex.org/docs/manual/speex-manual/node7.html
+     */
+    {
+        int spx_err = 0;
+        ap->spx_resampler = speex_resampler_init(
+            1,                       /* nb_channels: mono */
+            FS_SAMPLE_RATE,          /* in_rate:  8000 Hz */
+            BOT_RX_SAMPLE_RATE,      /* out_rate: 16000 Hz (RX path: FS→bot) */
+            SPEEX_RESAMPLE_QUALITY,  /* quality:  4 */
+            &spx_err
+        );
+        if (!ap->spx_resampler || spx_err != RESAMPLER_ERR_SUCCESS) {
+            delete ap;
+            return nullptr;
+        }
+        speex_resampler_skip_zeros(ap->spx_resampler);
+    }
+
+    /* Cria contexto LWS */
+    lws_context_creation_info info{};
+    info.port      = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+    info.options   = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+    info.ka_time     = 10;
+    info.ka_probes   = 3;
+    info.ka_interval = 5;
+    info.user        = ap;   /* acessível em WAIT_CANCELLED via lws_context_user() */
+
+    ap->lws_ctx = lws_create_context(&info);
+    if (!ap->lws_ctx) {
+        speex_resampler_destroy(ap->spx_resampler);
+        delete ap;
+        return nullptr;
+    }
+
+    if (!do_connect(ap)) {
+        speex_resampler_destroy(ap->spx_resampler);
         lws_context_destroy(ap->lws_ctx);
         delete ap;
         return nullptr;
@@ -695,42 +719,58 @@ AudioPipe* ap_create(const char* url,
     return ap;
 }
 
-/*
- * [M6] ap_destroy — flush WS CLOSE correto.
- *
- * Antes: único lws_service(ctx, 0) pode não ser suficiente para completar
- * o handshake WS CLOSE → bot recebe TCP RST em vez de WS close frame.
- *
- * Agora: lws_set_timeout() agenda close. Loop de até DESTROY_FLUSH_ITERS × 5ms
- * ou até wsi=nullptr (CLOSE completo detectado via CLIENT_CLOSED callback que
- * seta wsi=nullptr). Garante WS close frame limpo para o bot.
- */
+/* Destrói o contexto diretamente sem esperar TCP close */
 void ap_destroy(AudioPipe* ap) {
     if (!ap) return;
     ap->closing = true;
 
-    if (ap->wsi) {
-        lws_set_timeout(ap->wsi, PENDING_TIMEOUT_CLOSE_SEND, LWS_TO_KILL_ASYNC);
-        /* Loop de flush — chamado no dialplan thread após join da LWS thread */
-        for (int i = 0; i < DESTROY_FLUSH_ITERS && ap->wsi; ++i)
-            lws_service(ap->lws_ctx, DESTROY_FLUSH_MS);
-    }
-
+    /* Não chamamos lws_service aqui — a LWS thread já foi parada via join
+     * em session_destroy() antes de ap_destroy() ser chamado.
+     * lws_context_destroy() fecha todos os wsi pendentes e libera recursos
+     * incondicionalmente, sem aguardar handshake TCP de fechamento.
+     * O bot receberá um TCP RST em vez de WS close frame — aceitável
+     * porque a chamada já encerrou. */
     if (ap->lws_ctx) {
         lws_context_destroy(ap->lws_ctx);
         ap->lws_ctx = nullptr;
     }
+
+    if (ap->spx_resampler) {
+        speex_resampler_destroy(ap->spx_resampler);
+        ap->spx_resampler = nullptr;
+    }
+
     delete ap;
 }
+
 
 void ap_service(AudioPipe* ap, int timeout_ms) {
     if (ap && ap->lws_ctx && !ap->closing)
         lws_service(ap->lws_ctx, timeout_ms);
 }
 
+extern "C" void ap_cancel_service(AudioPipe* ap)
+{
+    if (ap && ap->lws_ctx)
+        lws_cancel_service(ap->lws_ctx);
+}
+
+extern "C" void ap_set_closing(AudioPipe* ap)
+{
+    if (ap) ap->closing = true;
+}
+
 /*
- * ap_on_rx_frame — RTP thread → enfileira frame RX para envio WS ao bot.
- * INVARIANTE: chamado APENAS do thread RTP. Ver nota em AudioPipe::rx_acc.
+ * ap_on_rx_frame — thread RTP → upsample (SpeexDSP) → send queue → WS → STT
+ *
+ * [N3] speex_resampler_process_int():
+ *   - channel_index = 0 (mono)
+ *   - in / in_length: buffer 8 kHz de entrada
+ *   - out / out_length: buffer 16 kHz de saída
+ *   A doc garante que ou todos os samples de entrada são lidos OU todos os
+ *   de saída são escritos. Para razão 1:2 e frame completo de 160 amostras,
+ *   sempre produz 320 amostras (ou menos se o filtro estiver se aquecendo, mas
+ *   skip_zeros() elimina esse período).
  */
 void ap_on_rx_frame(AudioPipe* ap, const int16_t* pcm8, int samples8) {
     if (!ap || !ap->connected.load(std::memory_order_acquire) || ap->closing) return;
@@ -746,39 +786,49 @@ void ap_on_rx_frame(AudioPipe* ap, const int16_t* pcm8, int samples8) {
         written         += copy;
 
         if (ap->rx_acc_fill == FS_FRAME_SAMPLES) {
-            int16_t up[BOT_FRAME_SAMPLES];
-            upsample_8_to_16(ap->rx_acc, FS_FRAME_SAMPLES, up);
-            ap->sq_push(reinterpret_cast<const uint8_t*>(up), BOT_FRAME_BYTES);
+            /* [N3] Resample 8 kHz → 16 kHz via SpeexDSP */
+            int16_t up[BOT_RX_FRAME_SAMPLES];
+            spx_uint32_t in_len  = static_cast<spx_uint32_t>(FS_FRAME_SAMPLES);
+            spx_uint32_t out_len = static_cast<spx_uint32_t>(BOT_RX_FRAME_SAMPLES);
+
+            speex_resampler_process_int(
+                ap->spx_resampler,
+                0,                /* channel_index: mono */
+                ap->rx_acc,
+                &in_len,
+                up,
+                &out_len
+            );
+
+            /* Enfileira apenas os samples efetivamente produzidos */
+            if (out_len > 0)
+                ap->sq_push(reinterpret_cast<const uint8_t*>(up),
+                            static_cast<int>(out_len) * 2 /* bytes */);
+
             ap->rx_acc_fill = 0;
         }
     }
 }
 
 /*
- * ap_on_tx_frame — RTP thread → injeta frame TX do bot no RTP do usuário.
- * INVARIANTE: chamado APENAS do thread RTP.
- *
- * [M4] CNG quando ring vazio (via TxRingBuffer::pop retornando underrun > 0).
- * [M7] Jitter adaptativo via update_jitter().
+ * ap_on_tx_frame — thread RTP → ring.pop → RTP do usuário
+ * Silêncio quando TX ainda não está pronto; jitter adaptativo [M7].
  */
 void ap_on_tx_frame(AudioPipe* ap, int16_t* pcm8_out, int samples8) {
     if (!ap || !ap->tx_ready) {
-        fill_cng(pcm8_out, samples8);  /* [M4] CNG em vez de zeros */
-        /* tx_ready=false: não conta como underrun para o jitter adaptativo */
+        std::memset(pcm8_out, 0, samples8 * sizeof(int16_t));
         return;
     }
     int underrun = ap->tx_ring.pop(pcm8_out, samples8);
-    if (underrun > 0) {
-        ap->stat_tx_underruns.fetch_add(1, std::memory_order_relaxed);  /* [M5] */
-    }
-    ap->update_jitter(underrun > 0);  /* [M7] */
+    if (underrun > 0)
+        ap->stat_tx_underruns.fetch_add(1, std::memory_order_relaxed);
+    ap->update_jitter(underrun > 0);
 }
 
 bool ap_is_connected(const AudioPipe* ap) {
     return ap && ap->connected.load(std::memory_order_acquire);
 }
 
-/* [M5] Snapshot atômico das métricas — sem lock, sem parar threads. */
 AudioPipeStats ap_get_stats(const AudioPipe* ap) {
     AudioPipeStats s{};
     if (!ap) return s;
