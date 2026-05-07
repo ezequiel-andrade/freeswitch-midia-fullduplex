@@ -1,224 +1,106 @@
-# 📞 Voice AI Pipeline (FreeSWITCH + Streaming AI)
-Diagrama lógico do fluxo de áudio e processamento (com barge-in, tool parallel e jitter control)
+# Voice AI Full-Duplex (FreeSWITCH + Pipecat)
 
-Este projeto implementa um pipeline de IA conversacional em tempo real para voz, integrado ao FreeSWITCH via mod_audio_fork, com suporte a full duplex, baixa latência e controle avançado de áudio.
--------------------------------------------------------------------------
+Projeto de voz em tempo real com chamada SIP no FreeSWITCH e pipeline de IA no bot Python.
 
-### 🧠 Visão Geral da Arquitetura
+## O que já está implementado
 
-```
-CALL (SIP)
-   │
-   ▼
-┌──────────────────────────────────────────────────────────────┐
-│                       FreeSWITCH                             │
-│                                                              │
-│   ┌──────────────────────────────────────────────────────┐   │
-│   │                  mod_audio_fork                      │   │
-│   │                                                      │   │
-│   │   RTP ↔ PCM                                          │   │
-│   │                                                      │   │
-│   │   RX: RTP → PCM (16k) ────────────────┐              │   │
-│   │                                       │              │   │
-│   │   TX: PCM (8k) → RTP (media inject) ◄─┘              │   │
-│   │                                                      │   │
-│   │   ⚙️ Jitter Buffer (RTP smoothing)                   │   │
-│   │   ────────────────────────────────                   │   │
-│   │   reorder / delay / loss handling                    │   │
-│   │                                                      │   │
-│   └───────────────────────────────┬──────────────────────┘   │
-└───────────────────────────────────┼──────────────────────────┘
-                                    │ WS (PCM binário)
-                                    ▼
-┌──────────────────────────────────────────────────────────────┐
-│                       pipeline.py                            │
-│                                                              │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │                BridgeSerializer                        │  │
-│  │                                                        │  │
-│  │  RX: PCM 16k → InputAudioRawFrame (STT)                │  │
-│  │  TX: OutputAudioRawFrame 8k → WS → FreeSWITCH          │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                                                              │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │ 🎤 BARGE-IN CONTROL                                    │  │
-│  │                                                        │  │
-│  │  VAD / STT detect speech                               │  │
-│  │       │                                                │  │
-│  │       ▼                                                │  │
-│  │  STOP TTS + limpar buffers                             │  │
-│  │  (interrompe áudio em execução)                        │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                                                              │
-│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐      │
-│  │ Deepgram STT │──►│ RAG Retriever│──►│ OpenAI LLM   │──┐   │
-│  └──────────────┘   └──────┬───────┘   └──────┬───────┘  │   │
-│                             │                  │         │   │
-│                             ▼                  ▼         │   │
-│                    ┌──────────────┐   ┌──────────────┐   │   │
-│                    │ vector_store │   │ context_mgr  │   │   │
-│                    │ Qdrant       │   │ sliding win  │   │   │
-│                    └──────────────┘   └──────────────┘   │   │
-│                                             │            │   │
-│                                             ▼            │   │
-│                                      ┌──────────────┐    │   │
-│                                      │ tools.py     │◄───┘   │
-│                                      │ (async exec) │        │
-│                                      └──────┬───────┘        │
-│                                             │                │
-│                           🧠 TOOL CALLING (PARALELO)         │
-│                           ──────────────────────────         │
-│                           não bloqueia o fluxo principal     │
-│                                             │                │
-│                                             ▼                │
-│                                      ┌───────────────┐       │
-│                                      │ resultado tool│       │
-│                                      └───────────────┘       │
-│                                                              │
-│                                              ┌──────────────┐│
-│                                              │ Cartesia TTS ││
-│                                              └──────┬───────┘│
-│                                                     │        │
-│                       🔁 AUDIO BUFFER (anti-jitter WS)       │
-│                       ────────────────────────────────       │
-│                       fila + ordenação + flush control       │
-│                                                     │        │
-└─────────────────────────────────────────────────────┼────────┘
-                                                      │
-                                                      ▼
-┌──────────────────────────────────────────────────────────────┐
-│                       FreeSWITCH                             │
-│                                                              │
-│   reprodução do áudio (já suavizado)                         │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
+- Stack Docker com 3 serviços:
+1. `redis` (redis-stack-server)
+2. `bot` (FastAPI + Pipecat)
+3. `freeswitch` (com `mod_audio_fork` custom compilado)
+
+- Fluxo full-duplex em produção local:
+1. Chamada SIP entra no FreeSWITCH
+2. Dialplan do ramal `509` executa `audio_fork` bloqueante
+3. `mod_audio_fork` envia RX por WebSocket para o bot (PCM 16kHz, após upsample)
+4. Bot processa com STT -> LLM -> TTS
+5. Bot devolve TX por WebSocket (PCM 8kHz)
+6. `mod_audio_fork` injeta TX no RTP da chamada
+
+- Bot (`bot/bot.py`) implementado com:
+1. FastAPI WebSocket em `/ws/{call_id}`
+2. Healthcheck em `/health`
+3. `BridgeSerializer` para conversão de frames de áudio
+4. STT com Deepgram (`nova-3`, `pt-BR`, `interim_results`)
+5. LLM com OpenAI-compatible endpoint
+6. TTS com Cartesia (8kHz PCM)
+7. VAD com Silero integrado no aggregator
+8. Interrupções habilitadas (`allow_interruptions=True`)
+9. Encerramento robusto por `on_client_disconnected` + watcher fallback
+
+- Tool calling funcional:
+1. Tool de data/hora (`get_current_datetime`)
+2. Tool de busca web (`search_web` via SerpAPI)
+3. Fallback para evitar vazamento de JSON técnico no TTS
+4. Mensagens amigáveis em falhas de tool/LLM
+
+- `mod_audio_fork` custom (`freeswitch/mod_audio_fork_build`) com:
+1. App de dialplan `audio_fork`
+2. Reconexão configurável (`max_reconnects=N`)
+3. Métricas por sessão via API `uuid_audio_fork_stats <uuid>`
+4. API de parada `uuid_audio_fork_stop <uuid>`
+5. Resampler RX com SpeexDSP (8kHz -> 16kHz)
+6. Jitter buffer adaptativo no caminho TX
+7. Envio de metadata JSON inicial da chamada para o bot
+8. Suporte a headers HTTP extras no handshake WS
+
+- Infra de execução:
+1. `freeswitch/entrypoint.sh` aplica conf custom, injeta variáveis e aguarda bot
+2. Healthchecks configurados para `redis`, `bot` e `freeswitch`
+3. `network_mode: host` para bot e freeswitch
+
+## Arquivos principais
+
+- `docker-compose.yml`
+- `bot/bot.py`
+- `bot/tools/datetime_tool.py`
+- `bot/tools/web_search_tool.py`
+- `freeswitch/Dockerfile`
+- `freeswitch/entrypoint.sh`
+- `freeswitch/conf/dialplan/06_audio_bridge.xml`
+- `freeswitch/mod_audio_fork_build/mod_audio_fork.c`
+- `freeswitch/mod_audio_fork_build/audio_pipe.cpp`
+
+## Como subir
+
+1. Preencha `.env` com as chaves obrigatórias:
+- `DEEPGRAM_API_KEY`
+- `OPENAI_API_KEY`
+- `OPENAI_API_BASE`
+- `OPENAI_MODEL`
+- `CARTESIA_API_KEY`
+- `SERPAPI_API_KEY`
+- `SIGNALWIRE_TOKEN` (build do FreeSWITCH)
+
+2. Suba os containers:
+
+```bash
+docker compose up -d --build
 ```
 
-O fluxo é baseado em um pipeline contínuo de áudio:
+3. Verifique saúde do bot:
 
-```
-CALL (SIP)
-   ↓
-FreeSWITCH (mod_audio_fork - full duplex)
-   ↓
-pipeline.py (processamento IA)
-   ↓
-FreeSWITCH (media inject)
+```bash
+curl -s http://127.0.0.1:8000/health
 ```
 
-### 🔄 Fluxo principal
-1. O FreeSWITCH recebe a chamada SIP (RTP).
-2. O módulo mod_audio_fork envia e recebe áudio via WebSocket full duplex.
-3. O pipeline.py processa o áudio com IA:
-   * Transcrição (STT)
-   * Contexto (RAG)
-   * Geração de resposta (LLM)
-   * Síntese de voz (TTS)
-4. O áudio gerado é retornado ao FreeSWITCH e reproduzido na chamada.
--------------------------------------------------------------------------
+4. Ligue para o ramal `509` no contexto configurado do FreeSWITCH.
 
-### 🧩 Componentes
-#### 📡 FreeSWITCH + mod_audio_fork
+## TODO (pendente de implementação)
 
-Responsável por:
-* Gerenciar SIP/RTP
-* Converter o áudio para PCM
-* Enviar/receber o áudio via WebSocket (full duplex)
-* Injetar o áudio de resposta na chamada (media inject)
+- [ ] RAG real (base vetorial, retrieval e injeção de contexto)
+- [ ] Integração com Qdrant ou outro vector store
+- [ ] Memória conversacional persistente entre chamadas
+- [ ] Streaming parcial de resposta para reduzir mais a latência percebida
+- [ ] Observabilidade centralizada (dashboards/alertas para métricas do mod_audio_fork e bot)
+- [ ] Testes automatizados (unitários e integração fim-a-fim)
+- [ ] CI/CD para build/test/publicação das imagens
+- [ ] Hardening de segurança (auth mútua no WS, secrets management, políticas de rede)
+- [ ] Multi-agentes/roteamento inteligente
+- [ ] Deploy distribuído (ex.: Kubernetes)
+- [ ] Estratégia de custo (cache, truncamento e controle de tokens)
 
-Recursos importantes:
-* Full duplex real (entrada e saída simultânea)
-* Jitter buffer RTP para suavização de áudio
-* Integração direta com o pipeline de IA
--------------------------------------------------------------------------
+## Observações
 
-🔁 BridgeSerializer
-Localizado no pipeline.py, é responsável por adaptar o áudio entre os formatos do FreeSWITCH e do pipeline:
-* RX (entrada):
-  * PCM 16kHz → InputAudioRawFrame (usado pelo STT)
-* TX (saída):
-  * OutputAudioRawFrame 8kHz → bytes → WebSocket → FreeSWITCH
-
-Esse componente garante compatibilidade entre:
-* STT (16kHz)
-* TTS / RTP (8kHz)
--------------------------------------------------------------------------
-
-## 🧠 Pipeline de IA (pipeline.py)
-Responsável por todo o processamento inteligente do áudio.
-Etapas:
-* STT (Speech-to-Text)
-  * Converte o áudio em texto em tempo real
-* RAG (Retrieval Augmented Generation)
-  * Recupera contexto relevante (ex: base vetorial)
-* LLM (Large Language Model)
-  * Gera a resposta baseada no contexto
-* TTS (Text-to-Speech)
-  * Converte texto em áudio
--------------------------------------------------------------------------
-
-## ⚙️ Funcionalidades Avançadas
-## 🎤 Barge-in (interrupção de fala)
-
-Permite que o usuário interrompa o bot enquanto ele está falando.
-Como funciona:
-* Detecta nova fala via VAD/STT
-* Interrompe imediatamente o TTS em execução
-* Limpa buffers de áudio
-* Prioriza a nova entrada do usuário
-👉 Resultado: interação mais natural e responsiva
--------------------------------------------------------------------------
-
-## 🧠 Tool Calling em Paralelo
-
-Permite que o LLM execute ferramentas externas sem bloquear o fluxo de áudio.
-Exemplos de ferramentas:
-* APIs externas
-* Banco de dados
-* Serviços internos
-
-Comportamento:
-* A chamada é executada de forma assíncrona
-* O TTS pode continuar (ex: “vou verificar isso…”)
-* A resposta final é integrada quando pronta
-👉 Evita pausas e melhora a experiência do usuário
--------------------------------------------------------------------------
-
-## 🔁 Controle de Jitter e Buffer de Áudio
-
-Garante estabilidade no áudio mesmo com variações de rede.
-Níveis de controle:
-### 1. FreeSWITCH (RTP)
-* Jitter buffer nativo
-* Reordenação de pacotes
-* Compensação de atraso
-
-### 2. Pipeline (WebSocket)
-* Buffer de áudio
-* Controle de fila
-* Flush e ordenação
-
-👉 Resultado:
-* Áudio contínuo
-* Redução de cortes e glitches
--------------------------------------------------------------------------
-
-## 🎯 Objetivos do Projeto
-* Baixa latência em conversação por voz
-* Comunicação full duplex em tempo real
-* Integração eficiente com modelos de IA
-* Arquitetura modular e escalável
-* Experiência de usuário natural (human-like)
--------------------------------------------------------------------------
-
-## 🚀 Próximos Passos
-* Streaming parcial (redução de latência)
-* Multi-agentes (roteamento inteligente)
-* Otimização de custo de tokens
-* Deploy em ambiente distribuído (Kubernetes)
--------------------------------------------------------------------------
-
-## 📌 Observações
-* O WebSocket é gerenciado diretamente pelo mod_audio_fork
-* O pipeline atua como consumidor/produtor de áudio
-* A arquitetura foi desenhada para ambientes de produção com VoIP
+- Existem arquivos de dialplan antigos em `freeswitch/dialplan/` (ex.: `07_audio_bridge.xml`) que documentam cenários anteriores; o fluxo ativo está em `freeswitch/conf/dialplan/06_audio_bridge.xml`.
+- O README anterior citava componentes não presentes no código atual (como RAG/Qdrant já em execução). Esta versão foi alinhada ao estado real do repositório.
