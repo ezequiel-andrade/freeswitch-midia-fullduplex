@@ -57,8 +57,8 @@
              Se o seu bot não requer autenticação, remova as duas linhas
              abaixo. O valor ${bot_token} pode vir de um arquivo de config
              ou de uma variável global definida em vars.xml. -->
-        <action application="set"
-                data="af_extra_headers=Authorization: Bearer ${bot_token}&#10;X-Session-ID: ${uuid}&#10;"/>
+        <!--action application="set"
+                data="af_extra_headers=Authorization: Bearer ${bot_token}&#10;X-Session-ID: ${uuid}&#10;"/-->
         <!--
           Nota: &#10; é o caractere \n (newline) no XML.
           Resultado: "Authorization: Bearer <token>\nX-Session-ID: <uuid>\n"
@@ -93,7 +93,7 @@
              "%(2000,4000,440,480)" = 2s de toque, 4s de silêncio, 440+480Hz -->
         <action application="pre_answer"/>
         <action application="playback"
-                data="tone_stream://%(2000,4000,440,480);loops=3"/>
+                data="tone_stream://%(2000,4000,440,480);loops=1"/>
 
         <!-- ── 6. Atende a chamada ────────────────────────────────────────
              answer() inicia o RTP bidirecional. A partir daqui, o media
@@ -108,10 +108,9 @@
 
         <!-- ── 8. Inicia o fork full-duplex (formato original) ───────────
              Metadados extras são enviados no primeiro JSON usando af_meta_*. -->
-        <action application="set" data="af_meta_direction=inbound"/>
-        <action application="set" data="af_meta_caller=${caller_id_number}"/>
-        <action application="set" data="af_meta_destination=${destination_number}"/>
-        <action application="set" data="af_meta_sample_rate=16000"/>
+        <!-- ── Campos extras de metadata — apenas dados que o C não captura ── -->
+        <action application="set" data="af_meta_plan=premium"/>
+        <action application="set" data="af_meta_language=pt-BR"/>
         <action application="audio_fork" data="ws://127.0.0.1:8000/ws/${uuid} max_reconnects=5"/>
 
         <!-- ── 9. Pós-fork: executado quando audio_fork retorna ───────────
@@ -127,65 +126,14 @@
     </extension>
 
   </context>
+
+    <!-- ── Contexto public: se vier de tronco SIP externo ── -->
+  <context name="public">
+    <extension name="bot-voice-510-public">
+      <condition field="destination_number" expression="^510$">
+        <action application="transfer" data="510 XML default"/>
+      </condition>
+    </extension>
+  </context>
+
 </include>
-
-<!--
-  ============================================================================
-  EXEMPLO DE SERVIDOR FASTAPI (bot.py)
-  ============================================================================
-
-  Requisitos:
-    pip install fastapi uvicorn websockets
-
-  Execução:
-    uvicorn bot:app --host 127.0.0.1 --port 8000
-
-  O servidor abaixo é um esqueleto mínimo que demonstra:
-    - Receber o frame JSON de metadata
-    - Receber frames PCM 16kHz (640 bytes = 320 samples) do FreeSWITCH
-    - Enviar frames PCM 8kHz (320 bytes = 160 samples) de volta
-
-  ─────────────────────────────────────────────────────────────────────────────
-
-  import asyncio
-  import json
-  from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
-  app = FastAPI()
-
-  FRAME_BYTES_IN  = 640   # recebe: 320 samples × 2 bytes × 16kHz × 20ms
-  FRAME_BYTES_OUT = 320   # envia:  160 samples × 2 bytes × 8kHz  × 20ms
-
-  @app.websocket("/ws/{uuid}")
-  async def websocket_endpoint(ws: WebSocket, uuid: str):
-      await ws.accept()
-      metadata = None
-
-      try:
-          while True:
-              msg = await ws.receive()
-
-              # Primeiro frame: metadata JSON (tipo text)
-              if msg["type"] == "websocket.receive" and "text" in msg:
-                  metadata = json.loads(msg["text"])
-                  print(f"[{uuid}] Conectado — metadata: {metadata}")
-                  continue
-
-              # Frames de áudio: PCM L16 binário 16kHz
-              if msg["type"] == "websocket.receive" and "bytes" in msg:
-                  audio_in = msg["bytes"]  # 640 bytes, 16kHz, mono
-
-                  # TODO: enviar audio_in para STT (ex: Deepgram, Whisper)
-                  # TODO: processar resposta LLM
-                  # TODO: sintetizar TTS (ex: Cartesia, ElevenLabs)
-
-                  # Envia áudio TTS de volta como PCM L16 8kHz, 320 bytes/frame
-                  # Exemplo: silêncio (substituir pelo TTS real)
-                  audio_out = bytes(FRAME_BYTES_OUT)
-                  await ws.send_bytes(audio_out)
-
-      except WebSocketDisconnect:
-          print(f"[{uuid}] Desconectado")
-
-  ============================================================================
--->

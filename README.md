@@ -57,7 +57,7 @@ Projeto de voz em tempo real com chamada SIP no FreeSWITCH e pipeline de IA no b
 - `bot/tools/web_search_tool.py`
 - `freeswitch/Dockerfile`
 - `freeswitch/entrypoint.sh`
-- `freeswitch/conf/dialplan/06_audio_bridge.xml`
+- `freeswitch/dialplan/07_audio_bridge.xml` (rota padrão atual)
 - `freeswitch/mod_audio_fork_build/mod_audio_fork.c`
 - `freeswitch/mod_audio_fork_build/audio_pipe.cpp`
 
@@ -102,5 +102,6 @@ curl -s http://127.0.0.1:8000/health
 
 ## Observações
 
-- Existem arquivos de dialplan antigos em `freeswitch/dialplan/` (ex.: `07_audio_bridge.xml`) que documentam cenários anteriores; o fluxo ativo está em `freeswitch/conf/dialplan/06_audio_bridge.xml`.
+- A rota de dialplan padrão atual é `freeswitch/dialplan/07_audio_bridge.xml`.
+- O arquivo `freeswitch/conf/dialplan/06_audio_bridge.xml` permanece no repositório como referência de configuração anterior.
 - O README anterior citava componentes não presentes no código atual (como RAG/Qdrant já em execução). Esta versão foi alinhada ao estado real do repositório.
