@@ -85,6 +85,8 @@ services:
       INTERNAL_IP: ${INTERNAL_IP:-192.168.2.110}
       BOT_HOST: "127.0.0.1"
       BOT_PORT: "8000"
+      AF_SPEEX_DENOISE_ENABLE: ${AF_SPEEX_DENOISE_ENABLE:-1}
+      AF_SPEEX_NOISE_SUPPRESS_DB: ${AF_SPEEX_NOISE_SUPPRESS_DB:-25}
     privileged: true
     cap_add:
       - NET_ADMIN

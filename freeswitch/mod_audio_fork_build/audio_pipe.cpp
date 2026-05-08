@@ -68,8 +68,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <libwebsockets.h>
+#include <speex/speex_preprocess.h>
 #include <speex/speex_resampler.h>   /* [N3] SpeexDSP */
 #include <string>
 #include <vector>
@@ -137,6 +139,19 @@ static constexpr int METADATA_MAX_BYTES = 2048;
 
 /* [N3] Qualidade do SpeexDSP resampler (0-10, doc sugere 3 para desktop) */
 static constexpr int SPEEX_RESAMPLE_QUALITY = 4;
+static constexpr int SPEEX_DENOISE_DB_DEFAULT = -22;
+static constexpr int SPEEX_NOISESUPPRESS_DB_DEFAULT = -25;
+
+static bool env_flag_enabled(const char* name, bool defv = false) {
+    const char* v = std::getenv(name);
+    if (!v) return defv;
+    return (*v == '1' || *v == 'y' || *v == 'Y' || *v == 't' || *v == 'T');
+}
+
+static int env_int_or(const char* name, int defv) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? std::atoi(v) : defv;
+}
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * TxRingBuffer — SPSC lock-free
@@ -291,6 +306,8 @@ struct AudioPipe {
      * de startup causado pelo delay interno do filtro FIR.
      * ──────────────────────────────────────────────────────────────────────── */
     SpeexResamplerState* spx_resampler = nullptr;
+    SpeexPreprocessState* spx_pp = nullptr;
+    bool                  spx_pp_enabled = false;
 
     /* ── Send queue SPSC (RTP thread → LWS thread) ──────────────────────────── */
     struct TxMsg {
@@ -692,6 +709,25 @@ AudioPipe* ap_create(const char*            url,
         speex_resampler_skip_zeros(ap->spx_resampler);
     }
 
+    /* Denoise opcional em 8 kHz (antes do upsample), estável para telefonia. */
+    if (env_flag_enabled("AF_SPEEX_DENOISE_ENABLE", false)) {
+        ap->spx_pp = speex_preprocess_state_init(FS_FRAME_SAMPLES, FS_SAMPLE_RATE);
+        if (ap->spx_pp) {
+            int denoise = 1;
+            int vad = 0;
+            int agc = 0;
+            int dereverb = 0;
+            int ns = env_int_or("AF_SPEEX_NOISE_SUPPRESS_DB", SPEEX_NOISESUPPRESS_DB_DEFAULT);
+
+            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_DENOISE, &denoise);
+            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_VAD, &vad);
+            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_AGC, &agc);
+            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_DEREVERB, &dereverb);
+            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &ns);
+            ap->spx_pp_enabled = true;
+        }
+    }
+
     /* Cria contexto LWS */
     lws_context_creation_info info{};
     info.port      = CONTEXT_PORT_NO_LISTEN;
@@ -738,6 +774,10 @@ void ap_destroy(AudioPipe* ap) {
     if (ap->spx_resampler) {
         speex_resampler_destroy(ap->spx_resampler);
         ap->spx_resampler = nullptr;
+    }
+    if (ap->spx_pp) {
+        speex_preprocess_state_destroy(ap->spx_pp);
+        ap->spx_pp = nullptr;
     }
 
     delete ap;
@@ -786,6 +826,10 @@ void ap_on_rx_frame(AudioPipe* ap, const int16_t* pcm8, int samples8) {
         written         += copy;
 
         if (ap->rx_acc_fill == FS_FRAME_SAMPLES) {
+            if (ap->spx_pp_enabled && ap->spx_pp) {
+                speex_preprocess_run(ap->spx_pp, ap->rx_acc);
+            }
+
             /* [N3] Resample 8 kHz → 16 kHz via SpeexDSP */
             int16_t up[BOT_RX_FRAME_SAMPLES];
             spx_uint32_t in_len  = static_cast<spx_uint32_t>(FS_FRAME_SAMPLES);

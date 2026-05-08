@@ -180,12 +180,13 @@ static switch_bool_t bug_callback(switch_media_bug_t *bug,
         agc_process(fs->agc,
                     (int16_t *)frame->data,
                     (int)(frame->datalen / sizeof(int16_t)));
-        /* Log de ganho a cada ~1s (50 frames de 20ms) */
+        /* Log de ganho a cada ~1s (50 frames de 20ms) 
         if (++(fs->agc_log_counter) >= 50) {
             fs->agc_log_counter = 0;
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
                 "[%s] AGC gain: %.1f dB\n", fs->uuid, agc_gain_db(fs->agc));
         }
+        */            
         ap_on_rx_frame(fs->ap,
                        (const int16_t *)frame->data,
                        (int)(frame->datalen / sizeof(int16_t)));
