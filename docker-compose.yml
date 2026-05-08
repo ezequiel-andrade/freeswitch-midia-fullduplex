@@ -38,6 +38,7 @@ services:
       redis:
         condition: service_healthy
     environment:
+      AUDIO_DEBUG_RECORD: "1"
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
       OPENAI_API_KEY:   ${OPENAI_API_KEY}
       OPENAI_API_BASE:  ${OPENAI_API_BASE}

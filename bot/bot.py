@@ -109,6 +109,49 @@ from pipecat.transports.websocket.fastapi import (
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
+# ── Debug: gravador de áudio por sessão ──────────────────────────────────────
+# Ativado via variável de ambiente: AUDIO_DEBUG_RECORD=1
+# Gera /tmp/rx_<call_id>.wav  — áudio que chega do mod_audio_fork (voz do usuário)
+# Gera /tmp/tx_<call_id>.wav  — áudio enviado para o RTP (TTS do bot)
+# NUNCA ativar em produção — escrita em disco por frame degrada latência.
+
+import struct
+import wave
+import io
+
+class AudioRecorder:
+    """Grava frames PCM em arquivo WAV durante a chamada."""
+
+    def __init__(self, path: str, sample_rate: int, channels: int = 1):
+        self._path        = path
+        self._sample_rate = sample_rate
+        self._channels    = channels
+        self._buf         = io.BytesIO()
+        self._enabled     = os.getenv("AUDIO_DEBUG_RECORD", "0") == "1"
+        if self._enabled:
+            logger.debug(f"AudioRecorder ativo: {path}")
+
+    def write(self, pcm_bytes: bytes) -> None:
+        if self._enabled and pcm_bytes:
+            self._buf.write(pcm_bytes)
+
+    def close(self) -> None:
+        if not self._enabled:
+            return
+        raw = self._buf.getvalue()
+        if not raw:
+            return
+        try:
+            with wave.open(self._path, "wb") as wf:
+                wf.setnchannels(self._channels)
+                wf.setsampwidth(2)                    # int16 = 2 bytes
+                wf.setframerate(self._sample_rate)
+                wf.writeframes(raw)
+            logger.info(f"AudioRecorder salvo: {self._path} ({len(raw)//2} samples)")
+        except Exception as e:
+            logger.warning(f"AudioRecorder erro ao salvar {self._path}: {e}")
+
+
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -146,22 +189,19 @@ class DeepgramSTTServiceQuiet(DeepgramSTTService):
 # Serializer — raw PCM bidirecional
 # ─────────────────────────────────────────────────────────────────────────────
 class BridgeSerializer(FrameSerializer):
-    """
-    RX (mod_audio_fork → bot):  PCM L16 @ 16kHz → AudioRawFrame para Deepgram
-    TX (bot → mod_audio_fork):  AudioRawFrame @ 8kHz → bytes → WRITE_REPLACE → RTP
-
-    [FIX #3] O pipecat 1.x removeu FrameSerializerType e a propriedade 'type'.
-    O transporte infere o tipo de mensagem WS (binário vs texto) diretamente
-    pelo tipo Python retornado por serialize(): bytes → binary, str → text.
-    Não é mais necessário declarar a propriedade 'type'.
-    """
-
     SAMPLE_RATE = 16_000
     CHANNELS    = 1
 
+    def __init__(self, rx_recorder: "AudioRecorder | None" = None,
+                       tx_recorder: "AudioRecorder | None" = None):
+        self._rx_rec = rx_recorder   # grava áudio chegando do FS (voz do usuário)
+        self._tx_rec = tx_recorder   # grava áudio saindo para o FS (TTS do bot)
+
     async def deserialize(self, data: bytes | str) -> Frame | None:
         if isinstance(data, bytes) and data:
-            # Pipecat 1.x espera InputAudioRawFrame vindo do transporte.
+            # Grava ANTES de entregar ao Deepgram — áudio exato que o STT recebe
+            if self._rx_rec:
+                self._rx_rec.write(data)
             return InputAudioRawFrame(
                 audio=data,
                 sample_rate=self.SAMPLE_RATE,
@@ -170,8 +210,10 @@ class BridgeSerializer(FrameSerializer):
         return None
 
     async def serialize(self, frame: Frame) -> bytes | None:
-        # Pipecat 1.x envia para o transporte frames de saída de áudio.
         if isinstance(frame, OutputAudioRawFrame) and frame.audio:
+            # Grava o TTS que vai para o RTP do usuário
+            if self._tx_rec:
+                self._tx_rec.write(frame.audio)
             return frame.audio
         return None
 
@@ -697,6 +739,17 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
     except (json.JSONDecodeError, Exception) as e:
         logger.warning(f"[{call_id}] Metadata inválida ou ausente: {e}")
 
+
+    # ── Debug recorders (apenas se AUDIO_DEBUG_RECORD=1) ────────────────────
+    rx_recorder = AudioRecorder(
+        path=f"/tmp/rx_{call_id[:8]}.wav",
+        sample_rate=16000,   # RX chega em 16kHz (mod_audio_fork faz upsample)
+    )
+    tx_recorder = AudioRecorder(
+        path=f"/tmp/tx_{call_id[:8]}.wav",
+        sample_rate=8000,    # TX sai em 8kHz (Cartesia → RTP)
+    )
+
     # ── Transport ──────────────────────────────────────────────────────────
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
@@ -704,7 +757,10 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            serializer=BridgeSerializer(),
+            serializer=BridgeSerializer(           # ← passa os recorders
+                rx_recorder=rx_recorder,
+                tx_recorder=tx_recorder,
+            ),
             audio_out_10ms_chunks=2,
             audio_out_sample_rate=8000,
             audio_in_sample_rate=16000,
@@ -896,6 +952,8 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"[{call_id}] on_client_disconnected — cancelando pipeline")
+        rx_recorder.close()   # ← salva rx_<call_id>.wav
+        tx_recorder.close()   # ← salva tx_<call_id>.wav
         await task.cancel()
 
     async def _disconnect_watcher():

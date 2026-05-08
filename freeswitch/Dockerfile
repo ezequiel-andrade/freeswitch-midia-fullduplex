@@ -39,6 +39,9 @@ WORKDIR /build
 COPY mod_audio_fork_build/mod_audio_fork.c  .
 COPY mod_audio_fork_build/audio_pipe.cpp    .
 COPY mod_audio_fork_build/audio_pipe.h      .
+COPY mod_audio_fork_build/agc_limiter.h     .
+COPY mod_audio_fork_build/agc_wrapper.h     .
+COPY mod_audio_fork_build/agc_wrapper.cpp   .
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Compilação com LWS dinâmica do apt (tem -fPIC — necessário para .so)
@@ -57,18 +60,22 @@ COPY mod_audio_fork_build/audio_pipe.h      .
 # que é a versão com -fPIC. Se -L/usr/local/lib fosse mantido, o linker
 # poderia preferir a .a do drachtio — que causa o erro de -fPIC.
 # ─────────────────────────────────────────────────────────────────────────────
-RUN g++ -std=c++14 -fPIC -O2 \
+RUN g++ -std=c++17 -fPIC -O2 \
         -I/usr/local/freeswitch/include/freeswitch \
         -I/usr/include \
         -c audio_pipe.cpp -o audio_pipe.o \
- && g++ -std=c++14 -fPIC -O2 \
+ && g++ -std=c++17 -fPIC -O2 \
+        -I/usr/local/freeswitch/include/freeswitch \
+        -I/usr/include \
+        -c agc_wrapper.cpp -o agc_wrapper.o \
+ && g++ -std=c++17 -fPIC -O2 \
         -I/usr/local/freeswitch/include/freeswitch \
         -I/usr/include \
         -c mod_audio_fork.c -o mod_audio_fork.o \
  && g++ -shared -fPIC \
         -Wl,-soname,mod_audio_fork.so \
         -o mod_audio_fork.so \
-        mod_audio_fork.o audio_pipe.o \
+        mod_audio_fork.o audio_pipe.o agc_wrapper.o \
         -lwebsockets \
         -lspeexdsp \
         -lstdc++ -lpthread \

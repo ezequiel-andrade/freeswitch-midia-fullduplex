@@ -39,7 +39,7 @@ LDFLAGS_DEV = $(LDFLAGS) -fsanitize=$(SANITIZE)
 
 # ─── Arquivos-fonte ──────────────────────────────────────────────────────────
 TARGET     := mod_audio_fork.so
-OBJS       := mod_audio_fork.o audio_pipe.o
+OBJS       := mod_audio_fork.o audio_pipe.o agc_wrapper.o
 
 # ─── Regras release ──────────────────────────────────────────────────────────
 .PHONY: all dev install clean reload check-deps stats
@@ -52,16 +52,20 @@ $(TARGET): $(OBJS)
 	@echo "✔  Compilado: $(TARGET)"
 	@echo "   Próximo passo: make install"
 
-mod_audio_fork.o: mod_audio_fork.c audio_pipe.h
+mod_audio_fork.o: mod_audio_fork.c audio_pipe.h agc_wrapper.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 audio_pipe.o: audio_pipe.cpp audio_pipe.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+agc_wrapper.o: agc_wrapper.cpp agc_wrapper.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ─── Build dev com sanitizers ─────────────────────────────────────────────────
 dev: check-deps
 	$(CC)  $(CFLAGS_DEV)  -c mod_audio_fork.c -o mod_audio_fork.o
 	$(CXX) $(CXXFLAGS_DEV) -c audio_pipe.cpp   -o audio_pipe.o
+	$(CXX) $(CXXFLAGS_DEV) -c agc_wrapper.cpp  -o agc_wrapper.o
 	$(CXX) $(LDFLAGS_DEV)  -o $(TARGET) $(OBJS)
 	@echo ""
 	@echo "✔  Build dev (SANITIZE=$(SANITIZE)): $(TARGET)"
@@ -76,7 +80,7 @@ reload: install
 	fs_cli -x "reload mod_audio_fork" || true
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) agc_wrapper.o $(TARGET)
 
 # ─── Consulta métricas em runtime ────────────────────────────────────────────
 # Uso: make stats UUID=<uuid-da-chamada>
