@@ -53,8 +53,6 @@
  *   uuid_audio_fork_stats <uuid>         — JSON com métricas [M5]
  */
 
-#include "agc_wrapper.h"
-
 #include <switch.h>
 #include "audio_pipe.h"
 
@@ -80,8 +78,6 @@ typedef struct {
     switch_atomic_t       running;
     switch_mutex_t       *mutex;
     switch_memory_pool_t *pool;
-    AgcHandle            *agc;   /* ← ADICIONAR AQUI */
-    int                  agc_log_counter;  /* ← ADICIONAR AQUI */
 } fork_session_t;
 
 static switch_hash_t         *sessions_hash  = NULL;
@@ -176,17 +172,6 @@ static switch_bool_t bug_callback(switch_media_bug_t *bug,
         frame = switch_core_media_bug_get_read_replace_frame(bug);
         if (!frame || !frame->data || frame->datalen == 0) break;
         if (!ap_is_connected(fs->ap)) break;
-        /* ── AGC: amplifica voz baixa antes de enviar ao bot ── */
-        agc_process(fs->agc,
-                    (int16_t *)frame->data,
-                    (int)(frame->datalen / sizeof(int16_t)));
-        /* Log de ganho a cada ~1s (50 frames de 20ms) 
-        if (++(fs->agc_log_counter) >= 50) {
-            fs->agc_log_counter = 0;
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-                "[%s] AGC gain: %.1f dB\n", fs->uuid, agc_gain_db(fs->agc));
-        }
-        */            
         ap_on_rx_frame(fs->ap,
                        (const int16_t *)frame->data,
                        (int)(frame->datalen / sizeof(int16_t)));
@@ -319,8 +304,6 @@ static fork_session_t *session_create(switch_core_session_t *sw_session,
         switch_core_destroy_memory_pool(&pool);
         return NULL;
     }
-    fs->agc = agc_create();   /* ← ADICIONAR AQUI */
-
     switch_mutex_lock(sessions_mutex);
     switch_core_hash_insert(sessions_hash, uuid, fs);
     switch_mutex_unlock(sessions_mutex);
@@ -349,7 +332,6 @@ static fork_session_t *session_create(switch_core_session_t *sw_session,
             switch_status_t ignored;
             switch_thread_join(&ignored, fs->svc_thread);
         }
-        agc_destroy(fs->agc);   /* ← ADICIONAR AQUI */
         ap_destroy(fs->ap);
         switch_mutex_lock(sessions_mutex);
         switch_core_hash_delete(sessions_hash, uuid);
