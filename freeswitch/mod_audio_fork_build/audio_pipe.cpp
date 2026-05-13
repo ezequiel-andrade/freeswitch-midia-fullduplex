@@ -71,8 +71,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <libwebsockets.h>
+<<<<<<< HEAD
 #include <speex/speex_preprocess.h>
 #include <speex/speex_resampler.h>   /* [N3] SpeexDSP */
+=======
+#include <speex/speex_resampler.h>    /* [N3] SpeexDSP resample        */
+#include <speex/speex_preprocess.h>   /* [N4] SpeexDSP denoise (8kHz)  */
+>>>>>>> 8565112 (Implementado variavel AUDIO_DEBUG_RECORD para gravar o audio,  para permitir analisar o audio do usuáruio que chega até o Bot)
 #include <string>
 #include <vector>
 
@@ -305,9 +310,14 @@ struct AudioPipe {
      * speex_resampler_skip_zeros() é chamado após init para eliminar artefato
      * de startup causado pelo delay interno do filtro FIR.
      * ──────────────────────────────────────────────────────────────────────── */
+<<<<<<< HEAD
     SpeexResamplerState* spx_resampler = nullptr;
     SpeexPreprocessState* spx_pp = nullptr;
     bool                  spx_pp_enabled = false;
+=======
+    SpeexResamplerState*  spx_resampler = nullptr;
+    SpeexPreprocessState* spx_pp        = nullptr;  /* [N4] denoise 8kHz (opcional) */
+>>>>>>> 8565112 (Implementado variavel AUDIO_DEBUG_RECORD para gravar o audio,  para permitir analisar o audio do usuáruio que chega até o Bot)
 
     /* ── Send queue SPSC (RTP thread → LWS thread) ──────────────────────────── */
     struct TxMsg {
@@ -709,6 +719,7 @@ AudioPipe* ap_create(const char*            url,
         speex_resampler_skip_zeros(ap->spx_resampler);
     }
 
+<<<<<<< HEAD
     /* Denoise opcional em 8 kHz (antes do upsample), estável para telefonia. */
     if (env_flag_enabled("AF_SPEEX_DENOISE_ENABLE", false)) {
         ap->spx_pp = speex_preprocess_state_init(FS_FRAME_SAMPLES, FS_SAMPLE_RATE);
@@ -725,6 +736,37 @@ AudioPipe* ap_create(const char*            url,
             speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_DEREVERB, &dereverb);
             speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &ns);
             ap->spx_pp_enabled = true;
+=======
+    /* [N4] SpeexDSP denoise — opera em 8kHz, antes do upsample.
+     *
+     * Habilitado via variável de ambiente AF_SPEEX_DENOISE_ENABLE=1.
+     * Adequado para PSTN/narrowband: remove ruído de fundo do carrier sem
+     * afetar o espectro de voz (opera na mesma banda do sinal original).
+     *
+     * AF_SPEEX_NOISE_SUPPRESS_DB: nível de supressão em dB (negativo).
+     *   -22 = leve, preserva ataque de consoantes plosivas
+     *   -25 = padrão (ITU-T recomendado para VoIP)
+     *   -30 = agressivo (pode suprimir fricativas /s/ /f/)
+     *
+     * Referência: speex.org/docs/manual/speex-manual/node7.html
+     */
+    {
+        const char* _denoise_env = std::getenv("AF_SPEEX_DENOISE_ENABLE");
+        if (_denoise_env && _denoise_env[0] == '1' && _denoise_env[1] == '\0') {
+            ap->spx_pp = speex_preprocess_state_init(FS_FRAME_SAMPLES, FS_SAMPLE_RATE);
+            if (ap->spx_pp) {
+                int denoise = 1;
+                int vad     = 0;  /* VAD fica no Silero/Pipecat — não duplicar aqui */
+                int agc     = 0;  /* AGC já é feito no agc_limiter */
+                const char* _ns_env = std::getenv("AF_SPEEX_NOISE_SUPPRESS_DB");
+                int ns_db = _ns_env ? std::atoi(_ns_env) : -22;
+                speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_DENOISE,        &denoise);
+                speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_VAD,            &vad);
+                speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_AGC,            &agc);
+                speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &ns_db);
+                lwsl_notice("ap_create: SpeexDSP denoise enabled (NS=%d dB)\n", ns_db);
+            }
+>>>>>>> 8565112 (Implementado variavel AUDIO_DEBUG_RECORD para gravar o audio,  para permitir analisar o audio do usuáruio que chega até o Bot)
         }
     }
 
@@ -780,6 +822,11 @@ void ap_destroy(AudioPipe* ap) {
         ap->spx_pp = nullptr;
     }
 
+    if (ap->spx_pp) {
+        speex_preprocess_state_destroy(ap->spx_pp);
+        ap->spx_pp = nullptr;
+    }
+
     delete ap;
 }
 
@@ -826,9 +873,15 @@ void ap_on_rx_frame(AudioPipe* ap, const int16_t* pcm8, int samples8) {
         written         += copy;
 
         if (ap->rx_acc_fill == FS_FRAME_SAMPLES) {
+<<<<<<< HEAD
             if (ap->spx_pp_enabled && ap->spx_pp) {
                 speex_preprocess_run(ap->spx_pp, ap->rx_acc);
             }
+=======
+            /* [N4] Denoise em 8kHz antes do upsample (se habilitado) */
+            if (ap->spx_pp)
+                speex_preprocess_run(ap->spx_pp, ap->rx_acc);
+>>>>>>> 8565112 (Implementado variavel AUDIO_DEBUG_RECORD para gravar o audio,  para permitir analisar o audio do usuáruio que chega até o Bot)
 
             /* [N3] Resample 8 kHz → 16 kHz via SpeexDSP */
             int16_t up[BOT_RX_FRAME_SAMPLES];

@@ -761,7 +761,7 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
                 rx_recorder=rx_recorder,
                 tx_recorder=tx_recorder,
             ),
-            audio_out_10ms_chunks=2,
+            audio_out_10ms_chunks=2,    # era 2 (20ms); 4=40ms dá mais headroom no ring buffer TX do mod_audio_fork
             audio_out_sample_rate=8000,
             audio_in_sample_rate=16000,
         ),
@@ -778,8 +778,10 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
             sample_rate=16000,
             channels=1,
             smart_format=True,
+            numerals=True,          # converte dígitos para texto nativamente no STT
             interim_results=True,
-            endpointing=150,    # reduzido de 300 → 150ms para menor latência
+            endpointing=200,        # 150ms cortava frases em PSTN (micro-pausas do carrier); 200ms mais robusto
+            utterance_end_ms="1000", # aguarda 1s de silêncio para confirmar fim de utterance
         ),
     )
 
@@ -817,10 +819,10 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    confidence=0.7,
+                    confidence=0.6,     # era 0.7 — PSTN tem SNR 37dB, threshold menor é mais seguro
                     start_secs=0.2,
-                    stop_secs=0.2,
-                    min_volume=0.6,
+                    stop_secs=0.3,      # era 0.2 — 200ms cortava fim de palavras em PSTN
+                    min_volume=0.4,     # era 0.6 — carrier móvel comprime amplitude
                 )
             ),
             # user_mute_strategies removido: TurnTrackingObserver crasha em
@@ -961,6 +963,8 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
         while websocket.client_state != WebSocketState.DISCONNECTED:
             await asyncio.sleep(0.3)
         logger.info(f"[{call_id}] WS DISCONNECTED detectado pelo watcher — cancelando pipeline")
+        rx_recorder.close()   # ← salva rx_<call_id>.wav (fallback)
+        tx_recorder.close()   # ← salva tx_<call_id>.wav (fallback)
         await task.cancel()  # idempotente se já cancelado pelo event handler
 
     watcher = asyncio.create_task(
@@ -977,6 +981,8 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
     finally:
         watcher.cancel()
         await task.cancel()  # idempotente
+        rx_recorder.close()  # garante gravação em qualquer caminho de saída
+        tx_recorder.close()  # garante gravação em qualquer caminho de saída
         logger.info(f"[{call_id}] Pipeline encerrada")
 
 

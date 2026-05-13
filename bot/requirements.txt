@@ -13,7 +13,9 @@ uvicorn[standard]>=0.30.6
 uvloop>=0.20.0
 
 # ── HTTP / WebSocket ──────────────────────────────────────────────────────────
-# Deixar pipecat resolver as versões corretas dessas dependências transitivas.
+# websockets 14+ removeu o parâmetro `no_delay` do connect(), quebrando o
+# deepgram-sdk. Fixar em <14 até que o SDK seja atualizado.
+websockets>=13.0,<14.0
 httpx>=0.28
 
 # ── Data / Env ────────────────────────────────────────────────────────────────
