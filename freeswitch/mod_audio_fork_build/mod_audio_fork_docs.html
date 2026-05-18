@@ -488,7 +488,7 @@
     The transport layer imposes no HTTP overhead, no request serialization, and no per-utterance connection setup. The media bug's <code>READ_REPLACE</code> and <code>WRITE_REPLACE</code> callbacks are invoked directly by the FreeSWITCH core on every 20 ms RTP tick. Audio bytes move from the RTP stack into the WebSocket send buffer in the same thread, without a copy through an HTTP body.
   </p>
   <p>
-    State — reconnection attempts, ring buffer depth, jitter window, CNG substitution — is maintained in C structs inside the running process, not reconstructed from a request payload on each call. The module enforces behavior in code: a disconnected bot triggers typed state transitions (<code>AP_EVENT_RECONNECTING</code> → <code>AP_EVENT_DISCONNECTED</code>) that drive typed C actions (hangup, CNG fill), not prompt re-evaluation.
+    State — reconnection attempts, ring buffer depth, jitter window, and optional RX CNG bridging — is maintained in C structs inside the running process, not reconstructed from a request payload on each call. The module enforces behavior in code: a disconnected bot triggers typed state transitions (<code>AP_EVENT_RECONNECTING</code> → <code>AP_EVENT_DISCONNECTED</code>) that drive typed C actions (hangup, silence fill), not prompt re-evaluation.
   </p>
 
   <div class="tip">
@@ -504,8 +504,9 @@
     <li>Session metadata frame sent as the first WebSocket TEXT message before any audio, allowing the bot to identify the session without parsing the URL.</li>
     <li>Custom HTTP headers on the WebSocket handshake (e.g. <code>Authorization: Bearer …</code>, tenant IDs).</li>
     <li>Configurable automatic reconnection with exponential backoff (100 ms → 5 000 ms).</li>
-    <li>Comfort Noise Generation (CNG) on the TX path when the bot is not sending audio.</li>
+    <li>Silence fill on the TX path when the bot is not sending audio (prevents underrun in RTP write frames).</li>
     <li>Adaptive jitter buffer on the RX path.</li>
+    <li>Optional RX CNG bridging controlled by <code>AF_RX_CNG_BRIDGE_ENABLE</code> (default: disabled).</li>
     <li>Production metrics: underruns, ring drops, send-queue drops, reconnection count, RX fragment bytes.</li>
     <li>Graceful teardown: <code>ap_cancel_service()</code> wakes the LWS thread immediately via the internal pipe/eventfd, avoiding 15-second teardown delays.</li>
     <li>Thread-safe design — media bug callbacks run on the RTP thread; the LWS service runs on a dedicated per-session thread.</li>
@@ -571,7 +572,7 @@
     <div class="flow-step">SIP caller</div>
   </div>
 
-  <p>The <code>WRITE_REPLACE</code> callback always writes exactly <code>FS_FRAME_SAMPLES = 160</code> samples (20 ms at 8 kHz). When the bot has not sent audio, CNG fills the frame so the RTP stream stays continuous.</p>
+  <p>The <code>WRITE_REPLACE</code> callback always writes exactly <code>FS_FRAME_SAMPLES = 160</code> samples (20 ms at 8 kHz). When the bot has not sent audio, zero/silence fills the frame so the RTP stream stays continuous.</p>
 
   <!-- ── WebSocket Protocol ──────────────────────────────────────────── -->
   <h2 id="ws-protocol">WebSocket Protocol</h2>
@@ -584,7 +585,7 @@
     <tbody>
       <tr><td><code>TEXT</code></td><td>FS → Bot</td><td>JSON session metadata</td><td>First frame, immediately after <code>ESTABLISHED</code></td></tr>
       <tr><td><code>BINARY</code></td><td>FS → Bot</td><td>PCM16 LE, 16 kHz, mono</td><td>Every RTP tick (~20 ms) while connected</td></tr>
-      <tr><td><code>BINARY</code></td><td>Bot → FS</td><td>PCM16 LE, 16 kHz, mono</td><td>TTS audio chunks from the bot</td></tr>
+      <tr><td><code>BINARY</code></td><td>Bot → FS</td><td>PCM16 LE, 8 kHz, mono</td><td>TTS audio chunks from the bot</td></tr>
     </tbody>
   </table>
 
@@ -636,7 +637,7 @@
     <thead><tr><th>Property</th><th>RX (FS → Bot)</th><th>TX (Bot → FS)</th></tr></thead>
     <tbody>
       <tr><td>Encoding</td><td>PCM16 LE</td><td>PCM16 LE</td></tr>
-      <tr><td>Sample rate</td><td>16 000 Hz</td><td>16 000 Hz (bot-side); 8 000 Hz injected into RTP</td></tr>
+      <tr><td>Sample rate</td><td>16 000 Hz</td><td>8 000 Hz</td></tr>
       <tr><td>Channels</td><td>Mono</td><td>Mono</td></tr>
       <tr><td>Frame size</td><td>~320 samples / 20 ms</td><td>Variable (ring buffer absorbs jitter)</td></tr>
       <tr><td>WS frame type</td><td>BINARY</td><td>BINARY</td></tr>
@@ -660,7 +661,7 @@
       AP_EVENT_CONNECTED
     </div>
     <div class="event-body">
-      <p>WebSocket handshake completed successfully. The metadata JSON frame has already been sent at this point. Audio frames may flow in both directions.</p>
+      <p>WebSocket handshake completed successfully. Metadata is scheduled as the first WS TEXT frame and audio begins immediately after. Audio frames may flow in both directions.</p>
     </div>
   </div>
 
@@ -759,7 +760,7 @@
 
   <div class="warning">
     <strong>Audio gap during reconnection</strong>
-    The TX path plays CNG while the bot is disconnected. The RX path continues to buffer caller audio but it is not transmitted. Audio captured during the reconnection window is dropped.
+    The TX path plays silence while the bot is disconnected. The RX path continues to capture caller audio but it is not transmitted. Audio captured during the reconnection window is dropped.
   </div>
 
   <!-- ── Custom WS Headers ──────────────────────────────────────────── -->
@@ -788,7 +789,7 @@ AudioPipeConfig cfg = {
   <p>In addition to the dialplan application, the module exposes two ESL/API commands.</p>
 
   <h4>uuid_audio_fork_stop</h4>
-  <p>Terminates the audio fork for the given channel UUID. The WebSocket is closed gracefully and the media bug is removed. The call itself is not hung up.</p>
+  <p>Stops the active fork by hanging up the channel with <code>NORMAL_CLEARING</code>; teardown then closes WebSocket and removes the media bug.</p>
   <pre><code>uuid_audio_fork_stop &lt;uuid&gt;</code></pre>
 
   <h4>uuid_audio_fork_stats</h4>
@@ -802,6 +803,10 @@ AudioPipeConfig cfg = {
   "rx_frag_bytes":  40320
 }</code></pre>
 
+  <h4>Environment toggle</h4>
+  <pre><code>AF_RX_CNG_BRIDGE_ENABLE=0</code></pre>
+  <p>When set to <code>1</code>, enables optional RX CNG bridging logic in <code>ap_on_rx_frame()</code>. Default <code>0</code> is recommended for natural speech.</p>
+
   <!-- ── Metrics ────────────────────────────────────────────────────── -->
   <h2 id="metrics">Metrics</h2>
   <p>The <code>AudioPipeStats</code> struct is populated in real time by the pipeline. Stats can be retrieved at any time via <code>uuid_audio_fork_stats</code> or read programmatically via <code>ap_get_stats()</code>.</p>
@@ -809,7 +814,7 @@ AudioPipeConfig cfg = {
   <table class="param-table">
     <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
     <tbody>
-      <tr><td>tx_underruns</td><td>uint64</td><td>Number of 20 ms frames where the TX ring buffer was empty and CNG was played instead of bot audio.</td></tr>
+      <tr><td>tx_underruns</td><td>uint64</td><td>Number of 20 ms frames where the TX ring buffer was empty and silence was played instead of bot audio.</td></tr>
       <tr><td>tx_ring_drops</td><td>uint64</td><td>Number of bot audio frames dropped because the TX ring buffer was full (back-pressure).</td></tr>
       <tr><td>sq_drops</td><td>uint64</td><td>Number of RX frames dropped because the send queue was full (bot ingestion too slow).</td></tr>
       <tr><td>ws_reconnects</td><td>uint64</td><td>Total number of WebSocket reconnection attempts made during this session.</td></tr>
