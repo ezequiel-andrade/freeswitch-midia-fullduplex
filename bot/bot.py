@@ -87,6 +87,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 # Não importar FrameSerializerType e não declarar propriedade 'type' no serializer.
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.rime.tts import RimeTTSService, RimeTTSSettings
 
 # [FIX #1] LiveOptions agora vem do pipecat, não do deepgram SDK.
 # O deepgram-sdk v6 removeu LiveOptions do namespace raiz ('from deepgram import LiveOptions').
@@ -771,6 +772,9 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
     # não do deepgram SDK (que removeu LiveOptions no v6).
     stt = DeepgramSTTServiceQuiet(
         api_key=os.environ["DEEPGRAM_API_KEY"],
+        # ttfs_p99_latency: DEEPGRAM_TTFS_P99=0.35s foi medido com stop_secs=0.2.
+        # Com stop_secs=0.5 (+300ms) o STT tem mais headroom, P99 efetivo ~0.25s.
+        ttfs_p99_latency=0.25,
         live_options=LiveOptions(
             model=os.getenv("STT_MODEL", "nova-3"),
             language="pt-BR",
@@ -780,8 +784,10 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
             smart_format=True,
             numerals=True,          # converte dígitos para texto nativamente no STT
             interim_results=True,
-            endpointing=200,        # 150ms cortava frases em PSTN (micro-pausas do carrier); 200ms mais robusto
-            utterance_end_ms="1000", # aguarda 1s de silêncio para confirmar fim de utterance
+            endpointing=500,        # era 200 — carrier VAD gera CNG 0xFE a cada 20-40ms dentro da fala;
+                                    # 200ms disparava speech_final em micro-silêncios (2.09 trans/s);
+                                    # 500ms resiste aos gaps do AMR DTX sem truncar utterances
+            utterance_end_ms="1500", # era 1000 — margem extra para frases com CNG interno
         ),
     )
 
@@ -799,14 +805,25 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
     )
 
     # ── TTS ───────────────────────────────────────────────────────────────
-    tts = CartesiaTTSService(
-        api_key=os.environ["CARTESIA_API_KEY"],
-        voice_id=os.getenv("TTS_VOICE", "a0e99841-438c-4a64-b679-ae501e7d6091"),
-        model=os.getenv("TTS_MODEL", "sonic-turbo"),  # sonic-turbo: ~40% menos TTFB
-        language=os.getenv("TTS_LANGUAGE", "pt"),
-        sample_rate=8000,
-        encoding="pcm_s16le",
+    # tts = CartesiaTTSService(
+    #     api_key=os.environ["CARTESIA_API_KEY"],
+    #     voice_id=os.getenv("TTS_VOICE", "a0e99841-438c-4a64-b679-ae501e7d6091"),
+    #     model=os.getenv("TTS_MODEL", "sonic-turbo"),  # sonic-turbo: ~40% menos TTFB
+    #     language=os.getenv("TTS_LANGUAGE", "pt"),
+    #     sample_rate=8000,
+    #     encoding="pcm_s16le",
+    # )
+
+    tts = RimeTTSService(
+            api_key     = os.getenv("RIME_API_KEY"),
+            sample_rate = 8000,
+            settings    = RimeTTSSettings(
+                voice    = "isadora",
+                model    = "arcana",
+                language = "por",
+            ),
     )
+
 
     # ── Context + Aggregator ───────────────────────────────────────────────
     # [NEW #1] LLMContext + LLMContextAggregatorPair (API universal 0.0.99+)
@@ -819,10 +836,12 @@ async def run_bot(websocket: WebSocket, call_id: str) -> None:
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    confidence=0.6,     # era 0.7 — PSTN tem SNR 37dB, threshold menor é mais seguro
-                    start_secs=0.2,
-                    stop_secs=0.3,      # era 0.2 — 200ms cortava fim de palavras em PSTN
-                    min_volume=0.4,     # era 0.6 — carrier móvel comprime amplitude
+                    confidence=0.5,     # era 0.6 — AMR→G.711 transcoding degrada onset; mais permissivo
+                    start_secs=0.05,    # era 0.2 — PSTN carrier VAD gera frames de fala em bursts de 20-40ms;
+                                        # 200ms nunca acumulava o contínuo necessário (13.2 cortes/s de fala)
+                    stop_secs=0.5,      # era 0.3 — CNG frames (0xFE) chegam a cada 20-40ms dentro da fala;
+                                        # 500ms evita encerrar o turno em micro-gaps do carrier VAD
+                    min_volume=0.2,     # era 0.4 — sinal PSTN chega em -2.4dBFS mas onset AMR é mais fraco
                 )
             ),
             # user_mute_strategies removido: TurnTrackingObserver crasha em

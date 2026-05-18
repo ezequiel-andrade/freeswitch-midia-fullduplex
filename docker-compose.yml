@@ -44,6 +44,7 @@ services:
       OPENAI_API_BASE:  ${OPENAI_API_BASE}
       OPENAI_MODEL:     ${OPENAI_MODEL}
       CARTESIA_API_KEY: ${CARTESIA_API_KEY}
+      RIME_API_KEY:     ${RIME_API_KEY}
       REDIS_URL:        "redis://127.0.0.1:6379"
       BOT_WS_PORT:      ${BOT_WS_PORT:-8000}
       STT_MODEL:        ${STT_MODEL:-nova-3}
@@ -83,10 +84,9 @@ services:
     environment:
       EXTERNAL_IP: ${EXTERNAL_IP:-192.168.2.110}
       INTERNAL_IP: ${INTERNAL_IP:-192.168.2.110}
+      AF_RX_CNG_BRIDGE_ENABLE: ${AF_RX_CNG_BRIDGE_ENABLE:-0}
       BOT_HOST: "127.0.0.1"
       BOT_PORT: "8000"
-      AF_SPEEX_DENOISE_ENABLE: ${AF_SPEEX_DENOISE_ENABLE:-1}
-      AF_SPEEX_NOISE_SUPPRESS_DB: ${AF_SPEEX_NOISE_SUPPRESS_DB:-25}
     privileged: true
     cap_add:
       - NET_ADMIN

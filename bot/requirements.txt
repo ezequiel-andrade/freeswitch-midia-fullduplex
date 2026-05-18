@@ -5,7 +5,7 @@
 #   - FastAPIWebsocketTransport movido para pipecat.transports.websocket.fastapi
 #   - vad_audio_passthrough removido do FastAPIWebsocketParams
 #   - LiveOptions agora fornecido pelo pipecat (não pelo deepgram-sdk v6)
-pipecat-ai[deepgram,openai,cartesia,silero]>=1.1.0,<2.0.0
+pipecat-ai[deepgram,openai,cartesia,silero,rime]>=1.1.0,<2.0.0
 
 # ── Web server ────────────────────────────────────────────────────────────────
 fastapi>=0.115.0

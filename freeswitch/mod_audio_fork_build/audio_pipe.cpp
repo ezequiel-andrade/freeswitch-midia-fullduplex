@@ -60,6 +60,26 @@
  *        delay interno do filtro com zeros, evitando artefato inicial.
  *        Destruição: speex_resampler_destroy() em ap_destroy().
  *
+ *   [N4] CNG bridging no path RX — filtro de frames de silêncio do carrier.
+ *
+ *        Evidência empírica (PCAP + tshark):
+ *          - 3143/3733 frames (84.2%) do carrier PSTN contêm 0xFE (G.711 μ-law
+ *            CNG/silêncio), gerados pela transcodificação AMR-SID → G.711 do SBC.
+ *          - 156 transições silêncio↔fala em 74.66s = 2.09 por segundo.
+ *          - Bursts de fala têm duração média de ~150ms (7-8 frames a 20ms).
+ *        Esses micro-silêncios de 20-40ms entre palavras reiniciam o contador
+ *        start_secs do SileroVAD, impedindo a detecção do turno do usuário.
+ *
+ *        Solução: após acumular um frame completo (160 samples @ 8kHz), detecta
+ *        se é CNG (peak < CNG_PEAK_THRESHOLD = 200 ≈ -44 dBFS). Se for CNG e
+ *        houver um frame de fala anterior em rx_last_speech, substitui o frame
+ *        CNG pelo último frame de fala por até CNG_BRIDGE_MAX_FRAMES (3 frames =
+ *        60ms). Após 60ms contínuos de silêncio, o silêncio passa normalmente —
+ *        o VAD pode então detectar o fim do turno corretamente.
+ *
+ *        O bridging ocorre ANTES do SpeexPreprocess e do resampler, garantindo
+ *        que o Speex processe o frame substituído (não o CNG original).
+ *
  * Dependências: libwebsockets ≥ 4.x, libspeexdsp, C++14
  */
 
@@ -71,7 +91,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <libwebsockets.h>
-#include <speex/speex_preprocess.h>
 #include <speex/speex_resampler.h>   /* [N3] SpeexDSP */
 #include <string>
 #include <vector>
@@ -139,18 +158,35 @@ static constexpr int METADATA_MAX_BYTES = 2048;
 
 /* [N3] Qualidade do SpeexDSP resampler (0-10, doc sugere 3 para desktop) */
 static constexpr int SPEEX_RESAMPLE_QUALITY = 4;
-static constexpr int SPEEX_DENOISE_DB_DEFAULT = -22;
-static constexpr int SPEEX_NOISESUPPRESS_DB_DEFAULT = -25;
+/* [N4] CNG bridging — carrier PSTN AMR→G.711 gera 84.2% de frames de silêncio (0xFE)
+ * a ~2.09 transições/segundo dentro da fala (evidência empírica do PCAP).
+ * Substituímos até CNG_BRIDGE_MAX_FRAMES consecutivos de CNG pelo último frame de fala
+ * para manter o SileroVAD ativo durante os micro-gaps do carrier VAD.
+ *
+ * ONSET HYSTERESIS (bug fix):
+ *   Os primeiros ~180ms de cada frase (AMR decoder warm-up) chegam como frames de
+ *   baixíssima amplitude (0xF6-0x60 → PCM 2-93) que estão ABAIXO do threshold 200.
+ *   Sem hysteresis, esses frames seriam classificados como CNG e substituídos por
+ *   áudio da frase ANTERIOR, injetando ghost-speech perceptível no onset.
+ *
+ *   Solução: bridging só é ativado DEPOIS de CNG_ONSET_MIN_FRAMES consecutivos de
+ *   fala real (peak > CNG_PEAK_THRESHOLD). Isso garante que estamos no meio da fala,
+ *   não no onset. Frames de onset passam através inalterados (incluindo os fracos).
+ *
+ *   Estado: SILENCE / ONSET (não estabelecido) → SPEECH_ESTABLISHED (rx_speech_established=true)
+ *     - SILENCE/ONSET: CNG passa inalterado. CNG longo: mantém estado.
+ *     - SPEECH_ESTABLISHED: CNG curto → bridge. CNG longo → reset para SILENCE.
+ *
+ * Evidência: 0xFE (±2 PCM), 0x7E (±2 PCM), 0xF0 (±30), 0x60 (±93) < 200.
+ *            0xC9 (±327), 0x4C (±279), 0x3C (±591) > 200 = fala real. */
+static constexpr int     CNG_BRIDGE_MAX_FRAMES  = 3;   /* 3 × 20ms = 60ms max bridge             */
+static constexpr int16_t CNG_PEAK_THRESHOLD     = 200; /* peak < 200 ≈ -44 dBFS → CNG/onset     */
+static constexpr int     CNG_ONSET_MIN_FRAMES   = 5;   /* 5 × 20ms = 100ms de fala p/ estabelecer */
 
 static bool env_flag_enabled(const char* name, bool defv = false) {
     const char* v = std::getenv(name);
     if (!v) return defv;
     return (*v == '1' || *v == 'y' || *v == 'Y' || *v == 't' || *v == 'T');
-}
-
-static int env_int_or(const char* name, int defv) {
-    const char* v = std::getenv(name);
-    return (v && *v) ? std::atoi(v) : defv;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -299,6 +335,21 @@ struct AudioPipe {
     int16_t rx_acc[FS_FRAME_SAMPLES];
     int     rx_acc_fill = 0;
 
+    /* ── [N4] CNG bridging (carrier PSTN VAD) ───────────────────────────────── *
+     * rx_last_speech:      cópia do último frame 8kHz com fala real confirmada. *
+     * rx_cng_count:        contador de frames CNG consecutivos.                 *
+     * rx_speech_frames:    contador de frames de fala consecutivos.             *
+     * rx_speech_established: true somente após CNG_ONSET_MIN_FRAMES de fala.   *
+     *   Onset hysteresis: frames de onset AMR (peak 2-93 < 200) passam         *
+     *   inalterados até que speech_established seja ativado — evita injetar     *
+     *   áudio da frase anterior no início de cada nova frase.                  *
+     * Acessados exclusivamente pelo thread RTP (sem lock necessário).           */
+    int16_t rx_last_speech[FS_FRAME_SAMPLES] = {};
+    int     rx_cng_count          = 0;
+    int     rx_speech_frames      = 0;
+    bool    rx_speech_established = false;
+    bool    rx_cng_bridge_enabled = false;
+
     /* ── [N3] SpeexDSP resampler (RX path: 8 kHz → 16 kHz) ─────────────────
      * Inicializado em ap_create(), destruído em ap_destroy().
      * Acesso exclusivo do thread RTP via ap_on_rx_frame() — sem lock necessário.
@@ -306,9 +357,6 @@ struct AudioPipe {
      * de startup causado pelo delay interno do filtro FIR.
      * ──────────────────────────────────────────────────────────────────────── */
     SpeexResamplerState* spx_resampler = nullptr;
-    SpeexPreprocessState* spx_pp = nullptr;
-    bool                  spx_pp_enabled = false;
-
     /* ── Send queue SPSC (RTP thread → LWS thread) ──────────────────────────── */
     struct TxMsg {
         uint8_t data[AP_LWS_PRE + BOT_RX_FRAME_BYTES];
@@ -686,6 +734,11 @@ AudioPipe* ap_create(const char*            url,
             ap->extra_headers = parse_extra_headers(cfg->extra_headers);
     }
 
+    /* Hotfix de produção:
+     * CNG bridge no RX pode introduzir artefato metálico/robótico em alguns carriers.
+     * Default OFF para preservar naturalidade; habilite explicitamente se necessário. */
+    ap->rx_cng_bridge_enabled = env_flag_enabled("AF_RX_CNG_BRIDGE_ENABLE", false);
+
     /* [N3] Inicializa SpeexDSP resampler 8 kHz → 16 kHz, qualidade 4.
      *
      * speex_resampler_init(nb_channels, in_rate, out_rate, quality, &err)
@@ -707,25 +760,6 @@ AudioPipe* ap_create(const char*            url,
             return nullptr;
         }
         speex_resampler_skip_zeros(ap->spx_resampler);
-    }
-
-    /* Denoise opcional em 8 kHz (antes do upsample), estável para telefonia. */
-    if (env_flag_enabled("AF_SPEEX_DENOISE_ENABLE", false)) {
-        ap->spx_pp = speex_preprocess_state_init(FS_FRAME_SAMPLES, FS_SAMPLE_RATE);
-        if (ap->spx_pp) {
-            int denoise = 1;
-            int vad = 0;
-            int agc = 0;
-            int dereverb = 0;
-            int ns = env_int_or("AF_SPEEX_NOISE_SUPPRESS_DB", SPEEX_NOISESUPPRESS_DB_DEFAULT);
-
-            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_DENOISE, &denoise);
-            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_VAD, &vad);
-            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_AGC, &agc);
-            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_DEREVERB, &dereverb);
-            speex_preprocess_ctl(ap->spx_pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &ns);
-            ap->spx_pp_enabled = true;
-        }
     }
 
     /* Cria contexto LWS */
@@ -775,11 +809,6 @@ void ap_destroy(AudioPipe* ap) {
         speex_resampler_destroy(ap->spx_resampler);
         ap->spx_resampler = nullptr;
     }
-    if (ap->spx_pp) {
-        speex_preprocess_state_destroy(ap->spx_pp);
-        ap->spx_pp = nullptr;
-    }
-
     delete ap;
 }
 
@@ -826,8 +855,55 @@ void ap_on_rx_frame(AudioPipe* ap, const int16_t* pcm8, int samples8) {
         written         += copy;
 
         if (ap->rx_acc_fill == FS_FRAME_SAMPLES) {
-            if (ap->spx_pp_enabled && ap->spx_pp) {
-                speex_preprocess_run(ap->spx_pp, ap->rx_acc);
+            /* [N4] CNG bridging com onset hysteresis (opcional via env).
+             *
+             * Problema: carrier AMR→G.711 gera dois tipos de frames abaixo do
+             * threshold CNG_PEAK_THRESHOLD=200:
+             *   a) Silêncio real (0xFE/0x7E → PCM ±2)
+             *   b) Onset AMR warm-up (0xF6..0x60 → PCM 2-93, ~180ms por frase)
+             *
+             * Sem hysteresis, o bridging substituiria os frames de onset (b) pelo
+             * áudio da frase anterior, injetando ghost-speech perceptível.
+             *
+             * Lógica de estados:
+             *   SILENCE/ONSET (rx_speech_established=false):
+             *     - CNG frames: pass through (preserva onset inalterado)
+             *     - Speech: incrementa rx_speech_frames; ao atingir
+             *       CNG_ONSET_MIN_FRAMES, ativa rx_speech_established
+             *   SPEECH_ESTABLISHED (rx_speech_established=true):
+             *     - CNG curto (≤ MAX): bridge com rx_last_speech
+             *     - CNG longo (> MAX): pass through, resetar para SILENCE
+             *     - Speech: atualiza rx_last_speech */
+            if (ap->rx_cng_bridge_enabled) {
+                bool is_cng = true;
+                for (int i = 0; i < FS_FRAME_SAMPLES; ++i) {
+                    if (std::abs(static_cast<int>(ap->rx_acc[i])) > CNG_PEAK_THRESHOLD) {
+                        is_cng = false;
+                        break;
+                    }
+                }
+                if (is_cng) {
+                    ap->rx_cng_count++;
+                    ap->rx_speech_frames = 0;
+                    if (ap->rx_speech_established) {
+                        if (ap->rx_cng_count <= CNG_BRIDGE_MAX_FRAMES) {
+                            /* SPEECH_ESTABLISHED + short CNG gap: bridge */
+                            std::memcpy(ap->rx_acc, ap->rx_last_speech, FS_FRAME_BYTES);
+                        } else {
+                            /* SPEECH_ESTABLISHED + long CNG: reset to SILENCE */
+                            ap->rx_speech_established = false;
+                        }
+                    }
+                    /* SILENCE/ONSET: CNG passes through unchanged */
+                } else {
+                    ap->rx_cng_count = 0;
+                    ap->rx_speech_frames++;
+                    if (!ap->rx_speech_established &&
+                        ap->rx_speech_frames >= CNG_ONSET_MIN_FRAMES) {
+                        ap->rx_speech_established = true;
+                    }
+                    std::memcpy(ap->rx_last_speech, ap->rx_acc, FS_FRAME_BYTES);
+                }
             }
 
             /* [N3] Resample 8 kHz → 16 kHz via SpeexDSP */
